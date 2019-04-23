@@ -676,7 +676,11 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 #endif
 }
 
-+(STKDataSource*) dataSourceFromURL:(NSURL*)url
++(STKDataSource*) dataSourceFromURL:(NSURL*)url {
+    return [STKAudioPlayer dataSourceFromURL:url options:(STKAudioPlayerOptions){}];
+}
+
++(STKDataSource*) dataSourceFromURL:(NSURL*)url options:(STKAudioPlayerOptions)optionsIn
 {
     STKDataSource* retval = nil;
     
@@ -686,7 +690,11 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     }
     else if ([url.scheme caseInsensitiveCompare:@"http"] == NSOrderedSame || [url.scheme caseInsensitiveCompare:@"https"] == NSOrderedSame)
     {
-        retval = [[STKAutoRecoveringHTTPDataSource alloc] initWithHTTPDataSource:[[STKHTTPDataSource alloc] initWithURL:url]];
+        if(nil != optionsIn.userAgent) {
+            retval = [[STKAutoRecoveringHTTPDataSource alloc] initWithHTTPDataSource:[[STKHTTPDataSource alloc] initWithURL:url httpRequestHeaders:@{@"User-Agent": optionsIn.userAgent}]];
+        } else {
+            retval = [[STKAutoRecoveringHTTPDataSource alloc] initWithHTTPDataSource:[[STKHTTPDataSource alloc] initWithURL:url]];
+        }
     }
     
     return retval;
@@ -738,6 +746,10 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     pthread_mutex_unlock(&playerMutex);
 }
 
+-(AudioComponentInstance)getAudioUnit {
+    return mixerUnit;
+}
+
 -(void) play:(NSString*)urlString
 {
 	[self play:urlString withQueueItemID:urlString];
@@ -747,7 +759,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 {
     NSURL* url = [NSURL URLWithString:urlString];
     
-	[self setDataSource:[STKAudioPlayer dataSourceFromURL:url] withQueueItemId:queueItemId];
+	[self setDataSource:[STKAudioPlayer dataSourceFromURL:url options:options] withQueueItemId:queueItemId];
 }
 
 -(void) playURL:(NSURL*)url
@@ -757,7 +769,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 
 -(void) playURL:(NSURL*)url withQueueItemID:(NSObject*)queueItemId
 {
-	[self setDataSource:[STKAudioPlayer dataSourceFromURL:url] withQueueItemId:queueItemId];
+	[self setDataSource:[STKAudioPlayer dataSourceFromURL:url options:options] withQueueItemId:queueItemId];
 }
 
 -(void) playDataSource:(STKDataSource*)dataSource
@@ -809,7 +821,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 
 -(void) queueURL:(NSURL*)url withQueueItemId:(NSObject*)queueItemId
 {
-	[self queueDataSource:[STKAudioPlayer dataSourceFromURL:url] withQueueItemId:queueItemId];
+	[self queueDataSource:[STKAudioPlayer dataSourceFromURL:url options:options] withQueueItemId:queueItemId];
 }
 
 -(void) queueDataSource:(STKDataSource*)dataSourceIn withQueueItemId:(NSObject*)queueItemId

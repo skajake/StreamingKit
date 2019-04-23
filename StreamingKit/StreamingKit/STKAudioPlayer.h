@@ -102,6 +102,8 @@ typedef struct
     Float32 gracePeriodAfterSeekInSeconds;
     /// Number of seconds of decompressed audio required before playback resumes after a buffer underrun (Default is 5 seconds. Must be larger than bufferSizeinSeconds)
     Float32 secondsRequiredToStartPlayingAfterBufferUnderun;
+    
+    NSString *userAgent;
 }
 STKAudioPlayerOptions;
 
@@ -190,6 +192,8 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 
 /// Initializes a new STKAudioPlayer with the given options
 -(instancetype) initWithOptions:(STKAudioPlayerOptions)optionsIn;
+
+-(AudioComponentInstance)getAudioUnit;
 
 /// Plays an item from the given URL string (all pending queued items are removed).
 /// The NSString is used as the queue item ID

@@ -2021,6 +2021,7 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
     OSStatus status;
     Boolean writable;
     UInt32 cookieSize = 0;
+    self.channelCount = asbd->mChannelsPerFrame;
     
     if (memcmp(asbd, &audioConverterAudioStreamBasicDescription, sizeof(AudioStreamBasicDescription)) == 0)
     {

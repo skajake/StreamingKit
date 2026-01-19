@@ -345,7 +345,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     
     canonicalAudioStreamBasicDescription = (AudioStreamBasicDescription)
     {
-        .mSampleRate = 44100.00,
+        .mSampleRate = 22050.00,//44100.00,
         .mFormatID = kAudioFormatLinearPCM,
         .mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked,
         .mFramesPerPacket = 1,
@@ -664,7 +664,11 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 #endif
 }
 
-+(STKDataSource*) dataSourceFromURL:(NSURL*)url
++(STKDataSource*) dataSourceFromURL:(NSURL*)url {
+    return [STKAudioPlayer dataSourceFromURL:url options:(STKAudioPlayerOptions){}];
+}
+
++(STKDataSource*) dataSourceFromURL:(NSURL*)url options:(STKAudioPlayerOptions)optionsIn
 {
     STKDataSource* retval = nil;
     
@@ -674,7 +678,11 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     }
     else if ([url.scheme caseInsensitiveCompare:@"http"] == NSOrderedSame || [url.scheme caseInsensitiveCompare:@"https"] == NSOrderedSame)
     {
-        retval = [[STKAutoRecoveringHTTPDataSource alloc] initWithHTTPDataSource:[[STKHTTPDataSource alloc] initWithURL:url]];
+        if(nil != optionsIn.userAgent) {
+            retval = [[STKAutoRecoveringHTTPDataSource alloc] initWithHTTPDataSource:[[STKHTTPDataSource alloc] initWithURL:url httpRequestHeaders:@{@"User-Agent": optionsIn.userAgent}]];
+        } else {
+            retval = [[STKAutoRecoveringHTTPDataSource alloc] initWithHTTPDataSource:[[STKHTTPDataSource alloc] initWithURL:url]];
+        }
     }
     
     return retval;
@@ -730,7 +738,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 {
     NSURL* url = [NSURL URLWithString:urlString];
     
-	[self setDataSource:[STKAudioPlayer dataSourceFromURL:url] withQueueItemId:queueItemId];
+    [self setDataSource:[STKAudioPlayer dataSourceFromURL:url options:options] withQueueItemId:queueItemId];
 }
 
 -(void) playURL:(NSURL*)url
@@ -740,7 +748,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 
 -(void) playURL:(NSURL*)url withQueueItemID:(NSObject*)queueItemId
 {
-	[self setDataSource:[STKAudioPlayer dataSourceFromURL:url] withQueueItemId:queueItemId];
+    [self setDataSource:[STKAudioPlayer dataSourceFromURL:url options:options] withQueueItemId:queueItemId];
 }
 
 -(void) playDataSource:(STKDataSource*)dataSource
@@ -1105,9 +1113,10 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 -(void) audioQueueFinishedPlaying:(STKQueueEntry*)entry
 {
     STKQueueEntry* next = [bufferingQueue dequeue];
-    
-    [self processFinishPlayingIfAnyAndPlayingNext:entry withNext:next];
-    [self processRunloop];
+    [self invokeOnPlaybackThread:^{
+        [self processFinishPlayingIfAnyAndPlayingNext:entry withNext:next];
+        [self processRunloop];
+    }];
 }
 
 -(void) setCurrentlyReadingEntry:(STKQueueEntry*)entry andStartPlaying:(BOOL)startPlaying
@@ -1212,7 +1221,8 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
             
             [self playbackThreadQueueMainThreadSyncBlock:^
             {
-                [self.delegate audioPlayer:self didStartPlayingQueueItemId:playingQueueItemId];
+                //Commenting this out so it does not try to reset the gain etc
+//                [self.delegate audioPlayer:self didStartPlayingQueueItemId:playingQueueItemId];
             }];
         }
     }
@@ -1673,6 +1683,19 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     [self processRunloop];
 }
 
+-(void)stopDataSource:(STKDataSource *)dataSource {
+    [self stop];
+}
+
+-(void) dataSource:(STKDataSource *)dataSource didUpdateMetaData:(NSDictionary *)metaDataDictionary bytes:(UInt64)bytes
+{
+    if ([self.delegate respondsToSelector:@selector(audioPlayer:didUpdateMetaData:bytes:)]) {
+        double secondsInBuffer = [currentlyPlayingEntry bufferFramesRemaining] / canonicalAudioStreamBasicDescription.mSampleRate;
+        double byteRate = [self bitRate] / 8.0;
+        [self.delegate audioPlayer:self didUpdateMetaData:metaDataDictionary bytes:bytes + secondsInBuffer * byteRate];
+    }
+}
+
 -(void) pause
 {
     pthread_mutex_lock(&playerMutex);
@@ -1962,6 +1985,7 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
     OSStatus status;
     Boolean writable;
     UInt32 cookieSize = 0;
+    self.channelCount = asbd->mChannelsPerFrame;
     
     if (memcmp(asbd, &audioConverterAudioStreamBasicDescription, sizeof(AudioStreamBasicDescription)) == 0)
     {
@@ -2221,6 +2245,20 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
     OSStatus status;
 	
 	CHECK_STATUS_AND_RETURN(AudioUnitSetParameter(eqUnit, kAUNBandEQParam_Gain + bandIndex, kAudioUnitScope_Global, 0, gain, 0));
+}
+
+-(void)setPan:(float)panValue {
+    int result = AudioUnitSetParameter(mixerUnit, kMultiChannelMixerParam_Pan, kAudioUnitScope_Input, 0, panValue, 0);
+    if (result == 0) {
+       NSLog(@"success");
+    }
+}
+
+-(void)setGain:(float)gainValue {
+    int result = AudioUnitSetParameter(mixerUnit, kMultiChannelMixerParam_Volume, kAudioUnitScope_Input, 0, gainValue, 0);
+    if (result == 0) {
+       NSLog(@"success");
+    }
 }
 
 -(AUNode) createConverterNode:(AudioStreamBasicDescription)srcFormat desFormat:(AudioStreamBasicDescription)desFormat
@@ -3441,5 +3479,8 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
     self->equalizerEnabled = value;
 }
 
+-(double)bitRate {
+    return [currentlyPlayingEntry calculatedBitRate];
+}
 
 @end

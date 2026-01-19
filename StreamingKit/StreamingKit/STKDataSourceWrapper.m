@@ -117,4 +117,12 @@
     [self.delegate dataSourceEof:self];
 }
 
+-(void) dataSource:(STKDataSource *)dataSource didUpdateMetaData:(NSDictionary *)metaDataDictionary bytes:(UInt64)bytes
+{
+    [self.delegate dataSource:self didUpdateMetaData:metaDataDictionary bytes:bytes];
+}
+-(void)stopDataSource:(STKDataSource *)dataSource {
+    [self.delegate stopDataSource:dataSource];
+}
+
 @end

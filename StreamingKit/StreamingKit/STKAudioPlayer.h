@@ -102,6 +102,8 @@ typedef struct
     Float32 gracePeriodAfterSeekInSeconds;
     /// Number of seconds of decompressed audio required before playback resumes after a buffer underrun (Default is 5 seconds. Must be larger than bufferSizeinSeconds)
     Float32 secondsRequiredToStartPlayingAfterBufferUnderun;
+
+    NSString *userAgent;
 }
 STKAudioPlayerOptions;
 
@@ -135,6 +137,9 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 /// Raised when items queued items are cleared (usually because of a call to play, setDataSource or stop)
 -(void) audioPlayer:(STKAudioPlayer*)audioPlayer didCancelQueuedItems:(NSArray*)queuedItems;
 
+// Raised when new meta data arrives
+-(void)audioPlayer:(STKAudioPlayer *)audioPlayer didUpdateMetaData:(NSDictionary *)metaData bytes:(UInt64)bytes;
+
 @end
 
 @interface STKAudioPlayer : NSObject<STKDataSourceDelegate>
@@ -152,6 +157,7 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 @property (readwrite) BOOL meteringEnabled;
 /// Enables or disables the EQ
 @property (readwrite) BOOL equalizerEnabled;
+@property (assign, readwrite) int channelCount;
 /// Returns an array of STKFrameFilterEntry objects representing the filters currently in use
 @property (readonly, nullable) NSArray* frameFilters;
 /// Returns the items pending to be played (includes buffering and upcoming items but does not include the current item)
@@ -268,6 +274,10 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 
 /// Sets the gain value (from -96 low to +24 high) for an equalizer band (0 based index)
 -(void) setGain:(float)gain forEqualizerBand:(int)bandIndex;
+
+-(void) setPan:(float)panValue;
+-(void) setGain:(float)gainValue;
+-(double)bitRate;
 
 @end
 

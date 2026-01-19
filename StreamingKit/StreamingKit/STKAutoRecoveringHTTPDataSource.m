@@ -70,6 +70,8 @@ static uint64_t GetTickCount(void)
     uint64_t ticksWhenLastDataReceived;
     SCNetworkReachabilityRef reachabilityRef;
     STKAutoRecoveringHTTPDataSourceOptions options;
+    int _reconnectAttempts;
+    int _successfullyConnected;
 }
 
 -(void) reachabilityChanged;
@@ -122,6 +124,7 @@ static void PopulateOptionsWithDefault(STKAutoRecoveringHTTPDataSourceOptions* o
 {
     if (self = [super initWithDataSource:innerDataSourceIn])
     {
+        _reconnectAttempts = 0;
         self.innerDataSource.delegate = self;
         
         struct sockaddr_in zeroAddress;
@@ -302,6 +305,7 @@ static void PopulateOptionsWithDefault(STKAutoRecoveringHTTPDataSourceOptions* o
     serial++;
     waitSeconds = 1;
     ticksWhenLastDataReceived = GetTickCount();
+    _successfullyConnected = true;
     
     [super dataSourceDataAvailable:dataSource];
 }
@@ -314,11 +318,29 @@ static void PopulateOptionsWithDefault(STKAutoRecoveringHTTPDataSourceOptions* o
     }
     
     NSLog(@"attemptReconnect %lld/%lld", self.position, self.length);
-    
-	if (self.innerDataSource.eventsRunLoop)
-	{
+    // Check if URL contains a license parameter - if so, don't retry with same URL
+    // Instead, trigger an error so RadioKitManager can fetch a new license
+    BOOL hasLicenseInUrl = NO;
+    if ([self.innerDataSource isKindOfClass:[STKHTTPDataSource class]]) {
+        STKHTTPDataSource* httpDataSource = (STKHTTPDataSource*)self.innerDataSource;
+        NSString* urlString = [[httpDataSource url] absoluteString];
+        hasLicenseInUrl = [urlString rangeOfString:@"?lic="].location != NSNotFound;
+        if (hasLicenseInUrl) {
+            NSLog(@"URL contains license parameter - triggering error to fetch new license");
+        }
+    }
+
+    if (hasLicenseInUrl) {
+        // Don't retry with same licensed URL - close and trigger error for new license fetch
+        [self close];
+        [self.delegate dataSourceErrorOccured:self];
+    } else if (self.innerDataSource.eventsRunLoop && (_reconnectAttempts < 3 || _successfullyConnected)) {
+        _reconnectAttempts += 1;
 		[self.innerDataSource reconnect];
-	}
+    } else {
+        [self close];
+        [self.delegate stopDataSource:self];
+    }
 }
 
 -(void) attemptReconnectWithTimer:(NSTimer*)timer
@@ -369,6 +391,10 @@ static void PopulateOptionsWithDefault(STKAutoRecoveringHTTPDataSourceOptions* o
     }
     
     [self.delegate dataSourceEof:self];
+}
+
+-(void)stopDataSource:(STKDataSource *)dataSource {
+    [self.delegate stopDataSource:dataSource];
 }
 
 -(void) dataSourceErrorOccured:(STKDataSource*)dataSource

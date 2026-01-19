@@ -121,4 +121,8 @@
     return [[self queueItemId] description];
 }
 
+-(SInt64)bufferFramesRemaining {
+    return self->framesQueued - self->framesPlayed;
+}
+
 @end

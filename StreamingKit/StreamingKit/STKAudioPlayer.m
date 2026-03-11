@@ -1101,7 +1101,8 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 -(void) createPlaybackThread
 {
     playbackThread = [[NSThread alloc] initWithTarget:self selector:@selector(startInternal) object:nil];
-    
+    playbackThread.qualityOfService = NSQualityOfServiceUserInteractive;
+
     [playbackThread start];
     
     [threadStartedLock lockWhenCondition:1];

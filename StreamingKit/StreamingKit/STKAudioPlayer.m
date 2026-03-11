@@ -1425,7 +1425,6 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 	@autoreleasepool
 	{
 		playbackThreadRunLoop = [NSRunLoop currentRunLoop];
-		NSThread.currentThread.threadPriority = 1;
 		
 		[threadStartedLock lockWhenCondition:0];
         [threadStartedLock unlockWithCondition:1];

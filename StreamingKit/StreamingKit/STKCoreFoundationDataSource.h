@@ -1,11 +1,11 @@
 /**********************************************************************************
  AudioPlayer.m
- 
+
  Created by Thong Nguyen on 14/05/2012.
  https://github.com/tumtumtum/audjustable
- 
+
  Copyright (c) 2012 Thong Nguyen (tumtumtum@gmail.com). All rights reserved.
- 
+
  Redistribution and use in source and binary forms, with or without
  modification, are permitted provided that the following conditions are met:
  1. Redistributions of source code must retain the above copyright
@@ -19,7 +19,7 @@
  4. Neither the name of Thong Nguyen nor the
  names of its contributors may be used to endorse or promote products
  derived from this software without specific prior written permission.
- 
+
  THIS SOFTWARE IS PROVIDED BY Thong Nguyen ''AS IS'' AND ANY
  EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
@@ -36,17 +36,8 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@class STKCoreFoundationDataSource;
-
-@interface CoreFoundationDataSourceClientInfo : NSObject
-@property (readwrite) CFReadStreamRef readStreamRef;
-@property (readwrite, retain) STKCoreFoundationDataSource* datasource;
-@end
-
 @interface STKCoreFoundationDataSource : STKDataSource
 {
-@public
-    CFReadStreamRef stream;
 @protected
     BOOL isInErrorState;
     NSRunLoop* eventsRunLoop;
@@ -54,14 +45,23 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (readonly) BOOL isInErrorState;
 
--(BOOL) reregisterForEvents;
-
 -(void) open;
 -(void) openCompleted;
 -(void) dataAvailable;
 -(void) eof;
 -(void) errorOccured;
--(CFStreamStatus) status;
+
+// Producer-side push API. Subclasses call these from any thread; the base
+// class forwards the resulting delegate callback to the registered
+// eventsRunLoop.
+-(void) didOpen;
+-(void) didReceiveData:(NSData*)data;
+-(void) didComplete;
+-(void) didFailWithError:(nullable NSError*)error;
+
+// Clears any buffered bytes and resets pending notifications. Subclasses
+// should call this when re-opening (e.g. on seek or reconnect).
+-(void) resetBuffer;
 
 @end
 

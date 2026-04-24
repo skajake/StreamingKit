@@ -1,11 +1,11 @@
 /**********************************************************************************
  AudioPlayer.m
- 
+
  Created by Thong Nguyen on 14/05/2012.
  https://github.com/tumtumtum/audjustable
- 
+
  Copyright (c) 2012 Thong Nguyen (tumtumtum@gmail.com). All rights reserved.
- 
+
  Redistribution and use in source and binary forms, with or without
  modification, are permitted provided that the following conditions are met:
  1. Redistributions of source code must retain the above copyright
@@ -19,7 +19,7 @@
  4. Neither the name of Thong Nguyen nor the
  names of its contributors may be used to endorse or promote products
  derived from this software without specific prior written permission.
- 
+
  THIS SOFTWARE IS PROVIDED BY Thong Nguyen ''AS IS'' AND ANY
  EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
@@ -35,7 +35,7 @@
 #import "STKHTTPDataSource.h"
 #import "STKLocalFileDataSource.h"
 
-@interface STKHTTPDataSource()
+@interface STKHTTPDataSource() <NSURLSessionDataDelegate>
 {
 @private
     BOOL supportsSeek;
@@ -45,12 +45,6 @@
     SInt64 fileLength;
     int discontinuous;
 	int requestSerialNumber;
-    int prefixBytesRead;
-    NSData* prefixBytes;
-    NSMutableData* iceHeaderData;
-    BOOL iceHeaderSearchComplete;
-    BOOL iceHeaderAvailable;
-    BOOL httpHeaderNotAvailable;
 
     NSURL* currentUrl;
     STKAsyncURLProvider asyncUrlProvider;
@@ -58,13 +52,15 @@
     AudioFileTypeID audioFileTypeHint;
     NSDictionary* requestHeaders;
 
+    NSURLSession* urlSession;
+    NSURLSessionDataTask* dataTask;
+    NSOperationQueue* delegateQueue;
+
     // Meta data
     BOOL metaDataPresent;
     unsigned int metaDataInterval;        // how many data bytes between meta data
     unsigned int metaDataBytesRemaining;  // how many bytes of metadata remain to be read
     unsigned int dataBytesRead;           // how many bytes of data have been read
-    BOOL foundIcyStart;
-    BOOL foundIcyEnd;
     NSMutableString *metaDataString;      //  meta data string
 }
 -(void) open;
@@ -88,7 +84,7 @@
 -(instancetype) initWithURLProvider:(STKURLProvider)urlProviderIn
 {
 	urlProviderIn = [urlProviderIn copy];
-    
+
     return [self initWithAsyncURLProvider:^(STKHTTPDataSource* dataSource, BOOL forSeek, STKURLBlock block)
     {
         block(urlProviderIn());
@@ -102,20 +98,26 @@
         seekStart = 0;
         relativePosition = 0;
         fileLength = -1;
-        
+
         self->asyncUrlProvider = [asyncUrlProviderIn copy];
-        
+
         audioFileTypeHint = [STKLocalFileDataSource audioFileTypeHintFromFileExtension:self->currentUrl.pathExtension];
 
         metaDataString = [NSMutableString new];
+
+        delegateQueue = [[NSOperationQueue alloc] init];
+        delegateQueue.maxConcurrentOperationCount = 1;
+        delegateQueue.name = @"com.streamingkit.httpdatasource";
     }
-    
+
     return self;
 }
 
 -(void) dealloc
 {
     NSLog(@"STKHTTPDataSource dealloc");
+
+    [self teardownSession];
 }
 
 -(NSURL*) url
@@ -127,7 +129,7 @@
 {
     static dispatch_once_t onceToken;
     static NSDictionary* fileTypesByMimeType;
-    
+
     dispatch_once(&onceToken, ^
     {
         fileTypesByMimeType =
@@ -159,14 +161,14 @@
             @"video/3gp2": @(kAudioFile3GP2Type)
         };
     });
-    
+
     NSNumber* number = [fileTypesByMimeType objectForKey:mimeType];
-    
+
     if (!number)
     {
         return 0;
     }
-    
+
     return (AudioFileTypeID)number.intValue;
 }
 
@@ -175,170 +177,47 @@
     return audioFileTypeHint;
 }
 
--(NSDictionary*) parseIceHeader:(NSData*)headerData
+-(id) headerValueForKey:(NSString*)key
 {
-    NSMutableDictionary* retval = [[NSMutableDictionary alloc] init];
-    NSCharacterSet* characterSet = [NSCharacterSet characterSetWithCharactersInString:@"\r\n"];
-    NSString* fullString = [[NSString alloc] initWithData:headerData encoding:NSUTF8StringEncoding];
-    NSArray* strings = [fullString componentsSeparatedByCharactersInSet:characterSet];
-    
-    httpHeaders = [NSMutableDictionary dictionary];
-    
-    for (NSString* s in strings)
+    // NSHTTPURLResponse.allHeaderFields keys are typically canonicalised but
+    // the spec says header lookup is case-insensitive; keep a defensive double
+    // lookup that preserves the old dual-case behaviour.
+    id value = [httpHeaders objectForKey:key];
+    if (value != nil)
     {
-        if (s.length == 0)
-        {
-            continue;
-        }
-        
-        if ([s hasPrefix:@"ICY "])
-        {
-            NSArray* parts = [s componentsSeparatedByString:@" "];
-            
-            if (parts.count >= 2)
-            {
-                self->httpStatusCode = [parts[1] intValue];
-            }
-            
-            continue;
-        }
-        
-        NSRange range = [s rangeOfString:@":"];
-        
-        if (range.location == NSNotFound)
-        {
-            continue;
-        }
-        
-        NSString* key = [s substringWithRange: (NSRange){.location = 0, .length = range.location}];
-        NSString* value = [s substringFromIndex:range.location + 1];
-        
-        [retval setValue:value forKey:key];
+        return value;
     }
-    
-    return retval;
+    return [httpHeaders objectForKey:[key lowercaseString]];
 }
 
--(BOOL) parseHttpHeader
+-(void) applyResponseHeaders:(NSHTTPURLResponse*)response
 {
-    if (!httpHeaderNotAvailable)
-    {
-        CFTypeRef response = CFReadStreamCopyProperty(stream, kCFStreamPropertyHTTPResponseHeader);
-        
-        if (response)
-        {
-            httpHeaders = (__bridge_transfer NSDictionary*)CFHTTPMessageCopyAllHeaderFields((CFHTTPMessageRef)response);
-            
-            if (httpHeaders.count == 0)
-            {
-                httpHeaderNotAvailable = YES;
-            }
-            else
-            {
-                self->httpStatusCode = (UInt32)CFHTTPMessageGetResponseStatusCode((CFHTTPMessageRef)response);
-            }
+    self->httpStatusCode = (UInt32)response.statusCode;
+    self->httpHeaders = response.allHeaderFields;
 
-            CFRelease(response);
-        }
-    }
-    
-    if (httpHeaderNotAvailable)
-    {
-        if (self->iceHeaderSearchComplete && !self->iceHeaderAvailable)
-        {
-            return YES;
-        }
-        
-        if (!self->iceHeaderSearchComplete)
-        {
-            UInt8 byte;
-            UInt8 terminal1[] = { '\n', '\n' };
-            UInt8 terminal2[] = { '\r', '\n', '\r', '\n' };
-
-            if (iceHeaderData == nil)
-            {
-                iceHeaderData = [NSMutableData dataWithCapacity:1024];
-            }
-            
-            while (true)
-            {
-                if (![self hasBytesAvailable])
-                {
-                    break;
-                }
-                
-                int read = [super readIntoBuffer:&byte withSize:1];
-                
-                if (read <= 0)
-                {
-                    break;
-                }
-                
-                [iceHeaderData appendBytes:&byte length:read];
-                
-                if (iceHeaderData.length >= sizeof(terminal1))
-                {
-                    if (memcmp(&terminal1[0], [self->iceHeaderData bytes] + iceHeaderData.length - sizeof(terminal1), sizeof(terminal1)) == 0)
-                    {
-                        self->iceHeaderAvailable = YES;
-                        self->iceHeaderSearchComplete = YES;
-                        
-                        break;
-                    }
-                }
-                
-                if (iceHeaderData.length >= sizeof(terminal2))
-                {
-                    if (memcmp(&terminal2[0], [self->iceHeaderData bytes] + iceHeaderData.length - sizeof(terminal2), sizeof(terminal2)) == 0)
-                    {
-                        self->iceHeaderAvailable = YES;
-                        self->iceHeaderSearchComplete = YES;
-                        
-                        break;
-                    }
-                }
-                
-                if (iceHeaderData.length >= 4)
-                {
-                    if (memcmp([self->iceHeaderData bytes], "ICY ", 4) != 0 && memcmp([self->iceHeaderData bytes], "HTTP", 4) != 0)
-                    {
-                        self->iceHeaderAvailable = NO;
-                        self->iceHeaderSearchComplete = YES;
-                        prefixBytes = iceHeaderData;
-                        
-                        return YES;
-                    }
-                }
-            }
-            
-            if (!self->iceHeaderSearchComplete)
-            {
-                return NO;
-            }
-        }
-
-        httpHeaders = [self parseIceHeader:self->iceHeaderData];
-        
-        self->iceHeaderData = nil;
-    }
-    
-    if (([httpHeaders objectForKey:@"Accept-Ranges"] ?: [httpHeaders objectForKey:@"accept-ranges"]) != nil)
+    if ([self headerValueForKey:@"Accept-Ranges"] != nil)
     {
         self->supportsSeek = YES;
     }
-    
+
+    NSString* metaInt = [self headerValueForKey:@"icy-metaint"] ?: [self headerValueForKey:@"Icy-Metaint"];
+    if (metaInt.length > 0)
+    {
+        metaDataPresent = YES;
+        metaDataInterval = (unsigned int)[metaInt intValue];
+    }
+
     if (self.httpStatusCode == 200)
     {
         if (seekStart == 0)
         {
-            id value = [httpHeaders objectForKey:@"Content-Length"] ?: [httpHeaders objectForKey:@"content-length"];
-            
+            id value = [self headerValueForKey:@"Content-Length"];
             fileLength = (SInt64)[value longLongValue];
         }
-        
-        NSString* contentType = [httpHeaders objectForKey:@"Content-Type"] ?: [httpHeaders objectForKey:@"content-type"] ;
+
+        NSString* contentType = [self headerValueForKey:@"Content-Type"];
         AudioFileTypeID typeIdFromMimeType = [STKHTTPDataSource audioFileTypeHintFromMimeType:contentType];
-        
+
         if (typeIdFromMimeType != 0)
         {
             audioFileTypeHint = typeIdFromMimeType;
@@ -346,61 +225,13 @@
     }
     else if (self.httpStatusCode == 206)
     {
-        NSString* contentRange = [httpHeaders objectForKey:@"Content-Range"] ?: [httpHeaders objectForKey:@"content-range"];
+        NSString* contentRange = [self headerValueForKey:@"Content-Range"];
         NSArray* components = [contentRange componentsSeparatedByString:@"/"];
-        
+
         if (components.count == 2)
         {
             fileLength = [[components objectAtIndex:1] integerValue];
         }
-    }
-    else if (self.httpStatusCode == 416)
-    {
-        if (self.length >= 0)
-        {
-            seekStart = self.length;
-        }
-        
-        [self eof];
-        
-        return NO;
-    }
-    else if (self.httpStatusCode >= 300)
-    {
-        [self errorOccured];
-        
-        return NO;
-    }
-    
-    return YES;
-}
-
--(void) dataAvailable
-{
-    if (stream == NULL)
-    {
-        return;
-    }
-    
-	if (self.httpStatusCode == 0)
-	{
-        if ([self parseHttpHeader])
-        {
-            if ([self hasBytesAvailable])
-            {
-                [super dataAvailable];
-            }
-            
-            return;
-        }
-        else
-        {
-            return;
-        }
-	}
-    else
-    {
-        [super dataAvailable];
     }
 }
 
@@ -414,39 +245,59 @@
     return fileLength >= 0 ? fileLength : 0;
 }
 
+-(void) teardownSession
+{
+    if (dataTask)
+    {
+        [dataTask cancel];
+        dataTask = nil;
+    }
+
+    if (urlSession)
+    {
+        [urlSession invalidateAndCancel];
+        urlSession = nil;
+    }
+}
+
+-(void) close
+{
+    [self teardownSession];
+    [super close];
+}
+
 -(void) reconnect
 {
     NSRunLoop* savedEventsRunLoop = eventsRunLoop;
-    
+
     [self close];
-    
+
     eventsRunLoop = savedEventsRunLoop;
-	
+
     [self seekToOffset:self->supportsSeek ? self.position : 0];
 }
 
 -(void) seekToOffset:(SInt64)offset
 {
     NSRunLoop* savedEventsRunLoop = eventsRunLoop;
-    
+
     [self close];
-    
+
     eventsRunLoop = savedEventsRunLoop;
-	
+
     NSAssert([NSRunLoop currentRunLoop] == eventsRunLoop, @"Seek called on wrong thread");
-    
-    stream = 0;
+
     relativePosition = 0;
     dataBytesRead = 0;
     seekStart = offset;
-    
+
     self->isInErrorState = NO;
-    
+
     if (!self->supportsSeek && offset != self->relativePosition)
     {
         return;
     }
-    
+
     [self openForSeek:YES];
 }
 
@@ -461,36 +312,20 @@
     {
         return 0;
     }
-    
-    if (prefixBytes != nil)
-    {
-        int count = MIN(size, (int)prefixBytes.length - prefixBytesRead);
-        
-        [prefixBytes getBytes:buffer length:count];
-        
-        prefixBytesRead += count;
-        
-        if (prefixBytesRead >= prefixBytes.length)
-        {
-            prefixBytes = nil;
-        }
-        
-        return count;
-    }
-    
+
     int read = [super readIntoBuffer:buffer withSize:size];
-    
-    if (read < 0)
+
+    if (read <= 0)
     {
         return read;
     }
-    
+
     // method will move audio bytes to the beginning of the buffer,
     // and return their number
-    read = [self checkForMetaDataInfoWithBuffer:buffer andLength:read];
+    read = [self demultiplexMetaDataFromBuffer:buffer andLength:read];
 
     relativePosition += read;
-    
+
     return read;
 }
 
@@ -502,17 +337,17 @@
 -(void) openForSeek:(BOOL)forSeek
 {
 	int localRequestSerialNumber;
-	
+
 	requestSerialNumber++;
 	localRequestSerialNumber = requestSerialNumber;
-	
+
     asyncUrlProvider(self, forSeek, ^(NSURL* url)
     {
 		if (localRequestSerialNumber != self->requestSerialNumber)
 		{
 			return;
 		}
-	
+
         self->currentUrl = url;
 
         if (url == nil)
@@ -520,83 +355,46 @@
             return;
         }
 
-        CFHTTPMessageRef message = CFHTTPMessageCreateRequest(NULL, (CFStringRef)@"GET", (__bridge CFURLRef)self->currentUrl, kCFHTTPVersion1_1);
+        [self resetBuffer];
 
-        if (seekStart > 0 && supportsSeek)
+        NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:url];
+        request.HTTPMethod = @"GET";
+        request.networkServiceType = NSURLNetworkServiceTypeBackground;
+
+        if (self->seekStart > 0 && self->supportsSeek)
         {
-            CFHTTPMessageSetHeaderFieldValue(message, CFSTR("Range"), (__bridge CFStringRef)[NSString stringWithFormat:@"bytes=%lld-", seekStart]);
+            [request setValue:[NSString stringWithFormat:@"bytes=%lld-", self->seekStart] forHTTPHeaderField:@"Range"];
 
-            discontinuous = YES;
+            self->discontinuous = YES;
         }
 
         for (NSString* key in self->requestHeaders)
         {
             NSString* value = [self->requestHeaders objectForKey:key];
-            
-            CFHTTPMessageSetHeaderFieldValue(message, (__bridge CFStringRef)key, (__bridge CFStringRef)value);
-        }
-        
-        CFHTTPMessageSetHeaderFieldValue(message, CFSTR("Accept"), CFSTR("*/*"));
-        CFHTTPMessageSetHeaderFieldValue(message, CFSTR("Ice-MetaData"), CFSTR("0"));
-        CFHTTPMessageSetHeaderFieldValue(message, CFSTR("icy-metadata"), CFSTR("1"));
 
-        stream = CFReadStreamCreateForHTTPRequest(NULL, message);
-
-        if (stream == nil)
-        {
-            CFRelease(message);
-
-            [self errorOccured];
-
-            return;
-        }
- 
-        CFReadStreamSetProperty(stream, (__bridge CFStringRef)NSStreamNetworkServiceTypeBackground, (__bridge CFStringRef)NSStreamNetworkServiceTypeBackground);
-
-        if (!CFReadStreamSetProperty(stream, kCFStreamPropertyHTTPShouldAutoredirect, kCFBooleanTrue))
-        {
-            CFRelease(message);
-
-            [self errorOccured];
-
-            return;
+            [request setValue:value forHTTPHeaderField:key];
         }
 
-        // Proxy support
-        CFDictionaryRef proxySettings = CFNetworkCopySystemProxySettings();
-        CFReadStreamSetProperty(stream, kCFStreamPropertyHTTPProxy, proxySettings);
-        CFRelease(proxySettings);
+        [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+        [request setValue:@"0" forHTTPHeaderField:@"Ice-MetaData"];
+        [request setValue:@"1" forHTTPHeaderField:@"icy-metadata"];
 
-        // SSL support
-        if ([self->currentUrl.scheme caseInsensitiveCompare:@"https"] == NSOrderedSame)
-        {
-            NSDictionary* sslSettings = [NSDictionary dictionaryWithObjectsAndKeys:
-                                         (NSString*)kCFStreamSocketSecurityLevelNegotiatedSSL, kCFStreamSSLLevel,
-                                         [NSNumber numberWithBool:NO], kCFStreamSSLValidatesCertificateChain,
-                                         nil];
-            CFReadStreamSetProperty(stream, kCFStreamPropertySSLSettings, (__bridge CFTypeRef)sslSettings);
-        }
+        NSURLSessionConfiguration* config = [NSURLSessionConfiguration defaultSessionConfiguration];
+        // Default config already picks up system proxy settings.
 
-        [self reregisterForEvents];
-        
-		self->httpStatusCode = 0;
-		
-        // Open
-        if (!CFReadStreamOpen(stream))
-        {
-            CFRelease(stream);
-            CFRelease(message);
-            
-            stream = 0;
+        self->urlSession = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:self->delegateQueue];
 
-            [self errorOccured];
+        self->httpStatusCode = 0;
+        self->httpHeaders = nil;
+        self->metaDataPresent = NO;
+        self->metaDataInterval = 0;
+        self->metaDataBytesRemaining = 0;
+        self->dataBytesRead = 0;
 
-            return;
-        }
-        
+        self->dataTask = [self->urlSession dataTaskWithRequest:request];
+        [self->dataTask resume];
+
         self->isInErrorState = NO;
-        
-        CFRelease(message);
     });
 }
 
@@ -620,6 +418,124 @@
     return self->supportsSeek;
 }
 
+#pragma mark - NSURLSessionDataDelegate
+
+-(void) URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)task
+didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler
+{
+    if (task != self->dataTask)
+    {
+        completionHandler(NSURLSessionResponseCancel);
+        return;
+    }
+
+    if (![response isKindOfClass:[NSHTTPURLResponse class]])
+    {
+        completionHandler(NSURLSessionResponseAllow);
+        return;
+    }
+
+    NSHTTPURLResponse* httpResponse = (NSHTTPURLResponse*)response;
+    [self applyResponseHeaders:httpResponse];
+
+    if (self.httpStatusCode == 416)
+    {
+        if (self.length >= 0)
+        {
+            seekStart = self.length;
+        }
+
+        completionHandler(NSURLSessionResponseCancel);
+        [self didComplete];
+        return;
+    }
+
+    if (self.httpStatusCode >= 300)
+    {
+        completionHandler(NSURLSessionResponseCancel);
+        [self didFailWithError:nil];
+        return;
+    }
+
+    [self didOpen];
+    completionHandler(NSURLSessionResponseAllow);
+}
+
+-(void) URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)task
+    didReceiveData:(NSData *)data
+{
+    if (task != self->dataTask)
+    {
+        return;
+    }
+
+    [self didReceiveData:data];
+}
+
+-(void) URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+didCompleteWithError:(NSError *)error
+{
+    if (task != self->dataTask)
+    {
+        return;
+    }
+
+    if (error)
+    {
+        // -999 is NSURLErrorCancelled — we cancelled ourselves for seek/reconnect.
+        if (error.code == NSURLErrorCancelled && [error.domain isEqualToString:NSURLErrorDomain])
+        {
+            return;
+        }
+
+        [self didFailWithError:error];
+    }
+    else
+    {
+        [self didComplete];
+    }
+}
+
+-(void) URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+willPerformHTTPRedirection:(NSHTTPURLResponse *)response
+        newRequest:(NSURLRequest *)request
+ completionHandler:(void (^)(NSURLRequest * _Nullable))completionHandler
+{
+    if (task != self->dataTask)
+    {
+        completionHandler(nil);
+        return;
+    }
+
+    self->currentUrl = request.URL;
+    completionHandler(request);
+}
+
+-(void) URLSession:(NSURLSession *)session
+didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
+ completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential * _Nullable))completionHandler
+{
+    // Match the legacy behaviour of kCFStreamSSLValidatesCertificateChain = NO:
+    // trust whatever the server presents.
+    if ([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust])
+    {
+        SecTrustRef serverTrust = challenge.protectionSpace.serverTrust;
+        if (serverTrust != NULL)
+        {
+            NSURLCredential* credential = [NSURLCredential credentialForTrust:serverTrust];
+            completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
+            return;
+        }
+    }
+
+    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+}
+
 #pragma mark - Meta data
 
 // This code was mostly taken from the link below
@@ -627,121 +543,54 @@
 
 // Returns new length: the number of bytes from buffer that contain audio data.
 // Other bytes are meta data bytes and this method "consumes" them.
--(int) checkForMetaDataInfoWithBuffer:(UInt8 *)buffer andLength:(int)length
+-(int) demultiplexMetaDataFromBuffer:(UInt8 *)buffer andLength:(int)length
 {
-    CFHTTPMessageRef response = (CFHTTPMessageRef)CFReadStreamCopyProperty(stream, kCFStreamPropertyHTTPResponseHeader);
-
-    NSString *bufferString = [[NSString alloc] initWithBytes:buffer length:length encoding:NSUTF8StringEncoding];
-    
-    if (foundIcyStart == NO && metaDataPresent == NO) {
-        // check if this is a ICY 200 OK response
-        NSString *icyCheck = [[NSString alloc] initWithBytes:buffer length:10 encoding:NSUTF8StringEncoding];
-        if (icyCheck != nil && [icyCheck caseInsensitiveCompare:@"ICY 200 OK"] == NSOrderedSame) {
-            foundIcyStart = YES;
-        } else {
-            NSString *metaInt = (__bridge NSString *) CFHTTPMessageCopyHeaderFieldValue(response, CFSTR("Icy-Metaint"));
-
-            if (metaInt) {
-                metaDataPresent = YES;
-                metaDataInterval = [metaInt intValue];
-            }
-        }
-    }
-
-    int streamStart = 0;
-
-    if (foundIcyStart == YES && foundIcyEnd == NO) {
-        char c[4] = {};
-
-        for (int lineStart = 0; streamStart + 3 < length; ++streamStart) {
-
-            memcpy(c, buffer + streamStart, 4);
-
-            if (c[0] == '\r' && c[1] == '\n') {
-                NSString *fullString = [[NSString alloc] initWithBytes:buffer length:streamStart encoding:NSUTF8StringEncoding];
-
-                int length = streamStart - lineStart;
-                if (streamStart > lineStart && length > 0 && (lineStart + length) <= [fullString length]) {
-                    NSString *line = [fullString substringWithRange:NSMakeRange(lineStart, length)];
-
-                    NSArray *lineItems = [line componentsSeparatedByString:@":"];
-                    if (lineItems.count > 1) {
-                        if ([lineItems[0] caseInsensitiveCompare:@"icy-metaint"] == NSOrderedSame) {
-                            metaDataInterval = [lineItems[1] intValue];
-                        } else if ([lineItems[0] caseInsensitiveCompare:@"content-type"] == NSOrderedSame) {
-                            AudioFileTypeID idFromMime = [STKHTTPDataSource audioFileTypeHintFromMimeType:lineItems[1]];
-                            if (idFromMime != 0) {
-                                audioFileTypeHint = idFromMime;
-                            }
-                        }
-                    }
-
-                    // this is the end of a line, the new line starts in 2
-                    lineStart = streamStart + 2;
-
-                    if (c[2] == '\r' && c[3] == '\n') {
-                        foundIcyEnd = YES;
-                        metaDataPresent = YES;
-                        streamStart += 4; // skip double new line
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if (metaDataPresent == YES) {
-        int audioDataByteCount = 0;
-
-        for (int i = streamStart; i < length; ++i) {
-            // is this a metadata byte?
-            if (metaDataBytesRemaining > 0) {
-
-                [metaDataString appendFormat:@"%c", buffer[i]];
-
-                if (--metaDataBytesRemaining == 0) {
-                    dataBytesRead = 0;
-
-                    NSDictionary *metaDataDictionary = [self dictionaryFromMetaData:metaDataString];
-                    [self.delegate dataSource:self didUpdateMetaData:metaDataDictionary bytes:(i - streamStart)];
-                }
-
-                continue;
-            }
-
-            // is this the interval byte?
-            if (metaDataInterval > 0 && dataBytesRead == metaDataInterval) {
-
-                metaDataBytesRemaining = buffer[i] * 16;
-
-                metaDataString.string = @"";
-
-                if (metaDataBytesRemaining == 0) {
-                    dataBytesRead = 0;
-                }
-
-                continue;
-            }
-
-            // this is a data byte
-            ++dataBytesRead;
-
-            // overwrite beginning of the buffer with the real audio data
-            // we don't need those bytes any more, since we already examined them
-            buffer[audioDataByteCount++] = buffer[i];
-        }
-
-        return audioDataByteCount;
-
-    } else if (foundIcyStart == YES) { // still parsing icy response
-
-        return 0;
-
-    } else { // no meta data in stream
-
+    if (!metaDataPresent || metaDataInterval == 0)
+    {
         return length;
-
     }
+
+    int audioDataByteCount = 0;
+
+    for (int i = 0; i < length; ++i) {
+        // is this a metadata byte?
+        if (metaDataBytesRemaining > 0) {
+
+            [metaDataString appendFormat:@"%c", buffer[i]];
+
+            if (--metaDataBytesRemaining == 0) {
+                dataBytesRead = 0;
+
+                NSDictionary *metaDataDictionary = [self dictionaryFromMetaData:metaDataString];
+                [self.delegate dataSource:self didUpdateMetaData:metaDataDictionary bytes:i];
+            }
+
+            continue;
+        }
+
+        // is this the interval byte?
+        if (dataBytesRead == metaDataInterval) {
+
+            metaDataBytesRemaining = buffer[i] * 16;
+
+            metaDataString.string = @"";
+
+            if (metaDataBytesRemaining == 0) {
+                dataBytesRead = 0;
+            }
+
+            continue;
+        }
+
+        // this is a data byte
+        ++dataBytesRead;
+
+        // overwrite beginning of the buffer with the real audio data
+        // we don't need those bytes any more, since we already examined them
+        buffer[audioDataByteCount++] = buffer[i];
+    }
+
+    return audioDataByteCount;
 }
 
 -(NSDictionary *) dictionaryFromMetaData:(NSString *)metaData

@@ -20,7 +20,6 @@ let package = Package(
             publicHeadersPath: ".",
             linkerSettings: [
                 .linkedFramework("AudioToolbox"),
-                .linkedFramework("CFNetwork"),
                 .linkedFramework("SystemConfiguration"),
                 .linkedFramework("CoreFoundation"),
                 .linkedFramework("AudioUnit", .when(platforms: [.macOS]))

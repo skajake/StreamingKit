@@ -1,11 +1,11 @@
 /**********************************************************************************
  AudioPlayer.m
- 
+
  Created by Thong Nguyen on 14/05/2012.
  https://github.com/tumtumtum/audjustable
- 
+
  Copyright (c) 2012 Thong Nguyen (tumtumtum@gmail.com). All rights reserved.
- 
+
  Redistribution and use in source and binary forms, with or without
  modification, are permitted provided that the following conditions are met:
  1. Redistributions of source code must retain the above copyright
@@ -19,7 +19,7 @@
  4. Neither the name of Thong Nguyen nor the
  names of its contributors may be used to endorse or promote products
  derived from this software without specific prior written permission.
- 
+
  THIS SOFTWARE IS PROVIDED BY Thong Nguyen ''AS IS'' AND ANY
  EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
@@ -34,36 +34,28 @@
 
 #import "STKCoreFoundationDataSource.h"
 
-static void ReadStreamCallbackProc(CFReadStreamRef stream, CFStreamEventType eventType, void* inClientInfo)
+@interface STKCoreFoundationDataSource ()
 {
-	STKCoreFoundationDataSource* datasource = (__bridge STKCoreFoundationDataSource*)inClientInfo;
-    
-    switch (eventType)
-    {
-        case kCFStreamEventErrorOccurred:
-        {
-            [datasource errorOccured];
-            break;
-        }
-        case kCFStreamEventEndEncountered:
-            [datasource eof];
-            break;
-        case kCFStreamEventHasBytesAvailable:
-            [datasource dataAvailable];
-            break;
-        case kCFStreamEventOpenCompleted:
-            [datasource openCompleted];
-            break;
-        default:
-            break;
-    }
+    NSMutableData* pendingBuffer;
+    NSLock* bufferLock;
+    BOOL dataAvailableScheduled;
+    BOOL eofScheduled;
+    BOOL errorScheduled;
+    uint64_t notificationEpoch;
 }
-
-@implementation CoreFoundationDataSourceClientInfo
-@synthesize readStreamRef, datasource;
 @end
 
 @implementation STKCoreFoundationDataSource
+
+-(instancetype) init
+{
+    if (self = [super init])
+    {
+        pendingBuffer = [[NSMutableData alloc] init];
+        bufferLock = [[NSLock alloc] init];
+    }
+    return self;
+}
 
 -(BOOL) isInErrorState
 {
@@ -83,42 +75,26 @@ static void ReadStreamCallbackProc(CFReadStreamRef stream, CFStreamEventType eve
 -(void) errorOccured
 {
     self->isInErrorState = YES;
-    
+
     [self.delegate dataSourceErrorOccured:self];
 }
 
 -(void) dealloc
 {
-    if (stream)
-    {
-        if (eventsRunLoop)
-        {
-        	[self unregisterForEvents];
-        }
-        
-        [self close];
-        
-        stream = 0;
-    }
+    [self close];
 }
 
 -(void) close
 {
-    if (stream)
-    {
-        if (eventsRunLoop)
-        {
-            [self unregisterForEvents];
-        }
-        
-        CFReadStreamClose(stream);
-        CFRelease(stream);
-        
-        stream = 0;
-    }
+    [self unregisterForEvents];
+    [self resetBuffer];
 }
 
 -(void) open
+{
+}
+
+-(void) openCompleted
 {
 }
 
@@ -126,76 +102,261 @@ static void ReadStreamCallbackProc(CFReadStreamRef stream, CFStreamEventType eve
 {
 }
 
+-(BOOL) hasBytesAvailable
+{
+    [bufferLock lock];
+    BOOL hasBytes = pendingBuffer.length > 0;
+    [bufferLock unlock];
+    return hasBytes;
+}
+
 -(int) readIntoBuffer:(UInt8*)buffer withSize:(int)size
 {
-    return (int)CFReadStreamRead(stream, buffer, size);
-}
-
--(void) unregisterForEvents
-{
-    if (stream)
+    if (size <= 0)
     {
-        CFReadStreamSetClient(stream, kCFStreamEventHasBytesAvailable | kCFStreamEventErrorOccurred | kCFStreamEventEndEncountered, NULL, NULL);
-        CFReadStreamUnscheduleFromRunLoop(stream, [eventsRunLoop getCFRunLoop], kCFRunLoopCommonModes);
+        return 0;
     }
-}
 
--(BOOL) reregisterForEvents
-{
-    if (eventsRunLoop && stream)
+    [bufferLock lock];
+
+    NSUInteger available = pendingBuffer.length;
+
+    if (available == 0)
     {
-        CFStreamClientContext context = {0, (__bridge void*)self, NULL, NULL, NULL};
-        CFReadStreamSetClient(stream, kCFStreamEventHasBytesAvailable | kCFStreamEventErrorOccurred | kCFStreamEventEndEncountered, ReadStreamCallbackProc, &context);
-        CFReadStreamScheduleWithRunLoop(stream, [eventsRunLoop getCFRunLoop], kCFRunLoopCommonModes);
-        
-        return YES;
+        [bufferLock unlock];
+        return self->isInErrorState ? -1 : 0;
     }
-    
-    return NO;
+
+    NSUInteger toCopy = MIN((NSUInteger)size, available);
+    memcpy(buffer, pendingBuffer.bytes, toCopy);
+
+    if (toCopy < available)
+    {
+        [pendingBuffer replaceBytesInRange:NSMakeRange(0, toCopy) withBytes:NULL length:0];
+    }
+    else
+    {
+        pendingBuffer.length = 0;
+    }
+
+    [bufferLock unlock];
+
+    return (int)toCopy;
 }
 
 -(BOOL) registerForEvents:(NSRunLoop*)runLoop
 {
     eventsRunLoop = runLoop;
-    
-	if (!stream)
-    {
-		// Will register when they open or seek
-		
-        return YES;
-    }
- 
-    CFStreamClientContext context = {0, (__bridge void*)self, NULL, NULL, NULL};
-    
-    CFReadStreamSetClient(stream, kCFStreamEventHasBytesAvailable | kCFStreamEventErrorOccurred | kCFStreamEventEndEncountered, ReadStreamCallbackProc, &context);
-    
-    CFReadStreamScheduleWithRunLoop(stream, [eventsRunLoop getCFRunLoop], kCFRunLoopCommonModes);
+
+    // If bytes/eof/error accumulated before registration, kick them now.
+    [self scheduleIfPending];
 
     return YES;
 }
 
--(BOOL) hasBytesAvailable
+-(void) unregisterForEvents
 {
-    if (!stream)
-    {
-        return NO;
-    }
-    
-    return CFReadStreamHasBytesAvailable(stream);
+    // Bump the epoch; any blocks already queued on the run loop will bail out.
+    [bufferLock lock];
+    notificationEpoch++;
+    dataAvailableScheduled = NO;
+    eofScheduled = NO;
+    errorScheduled = NO;
+    [bufferLock unlock];
+
+    eventsRunLoop = nil;
 }
 
--(CFStreamStatus) status
+-(void) resetBuffer
 {
-    if (stream)
-    {
-        return CFReadStreamGetStatus(stream);
-    }
-    
-    return 0;
+    [bufferLock lock];
+    pendingBuffer.length = 0;
+    notificationEpoch++;
+    dataAvailableScheduled = NO;
+    eofScheduled = NO;
+    errorScheduled = NO;
+    self->isInErrorState = NO;
+    [bufferLock unlock];
 }
 
--(void) openCompleted
+#pragma mark - Producer push API
+
+-(void) didOpen
 {
+    NSRunLoop* runLoop = eventsRunLoop;
+    if (runLoop == nil)
+    {
+        return;
+    }
+
+    uint64_t epoch;
+    [bufferLock lock];
+    epoch = notificationEpoch;
+    [bufferLock unlock];
+
+    CFRunLoopPerformBlock([runLoop getCFRunLoop], (__bridge CFStringRef)NSRunLoopCommonModes, ^
+    {
+        if ([self currentEpochIs:epoch])
+        {
+            [self openCompleted];
+        }
+    });
+    CFRunLoopWakeUp([runLoop getCFRunLoop]);
+}
+
+-(void) didReceiveData:(NSData*)data
+{
+    if (data.length > 0)
+    {
+        [bufferLock lock];
+        [pendingBuffer appendData:data];
+        [bufferLock unlock];
+    }
+
+    [self scheduleDataAvailable];
+}
+
+-(void) didComplete
+{
+    [bufferLock lock];
+    if (eofScheduled)
+    {
+        [bufferLock unlock];
+        return;
+    }
+    eofScheduled = YES;
+    uint64_t epoch = notificationEpoch;
+    [bufferLock unlock];
+
+    NSRunLoop* runLoop = eventsRunLoop;
+    if (runLoop == nil)
+    {
+        return;
+    }
+
+    CFRunLoopPerformBlock([runLoop getCFRunLoop], (__bridge CFStringRef)NSRunLoopCommonModes, ^
+    {
+        if ([self currentEpochIs:epoch])
+        {
+            [self eof];
+        }
+    });
+    CFRunLoopWakeUp([runLoop getCFRunLoop]);
+}
+
+-(void) didFailWithError:(NSError*)error
+{
+    [bufferLock lock];
+    if (errorScheduled)
+    {
+        [bufferLock unlock];
+        return;
+    }
+    errorScheduled = YES;
+    self->isInErrorState = YES;
+    uint64_t epoch = notificationEpoch;
+    [bufferLock unlock];
+
+    NSRunLoop* runLoop = eventsRunLoop;
+    if (runLoop == nil)
+    {
+        return;
+    }
+
+    CFRunLoopPerformBlock([runLoop getCFRunLoop], (__bridge CFStringRef)NSRunLoopCommonModes, ^
+    {
+        if ([self currentEpochIs:epoch])
+        {
+            [self errorOccured];
+        }
+    });
+    CFRunLoopWakeUp([runLoop getCFRunLoop]);
+}
+
+#pragma mark - Internal scheduling
+
+-(void) scheduleDataAvailable
+{
+    [bufferLock lock];
+    if (dataAvailableScheduled || pendingBuffer.length == 0)
+    {
+        [bufferLock unlock];
+        return;
+    }
+    dataAvailableScheduled = YES;
+    uint64_t epoch = notificationEpoch;
+    [bufferLock unlock];
+
+    NSRunLoop* runLoop = eventsRunLoop;
+    if (runLoop == nil)
+    {
+        // Will be kicked when registerForEvents: runs.
+        return;
+    }
+
+    CFRunLoopPerformBlock([runLoop getCFRunLoop], (__bridge CFStringRef)NSRunLoopCommonModes, ^
+    {
+        [self fireDataAvailableForEpoch:epoch];
+    });
+    CFRunLoopWakeUp([runLoop getCFRunLoop]);
+}
+
+-(void) fireDataAvailableForEpoch:(uint64_t)epoch
+{
+    [bufferLock lock];
+    if (epoch != notificationEpoch)
+    {
+        [bufferLock unlock];
+        return;
+    }
+    dataAvailableScheduled = NO;
+    BOOL hasBytes = pendingBuffer.length > 0;
+    [bufferLock unlock];
+
+    if (hasBytes)
+    {
+        [self dataAvailable];
+    }
+}
+
+-(void) scheduleIfPending
+{
+    [bufferLock lock];
+    BOOL hasBytes = pendingBuffer.length > 0 && !dataAvailableScheduled;
+    BOOL fireEof = eofScheduled;
+    BOOL fireError = errorScheduled;
+    [bufferLock unlock];
+
+    if (hasBytes)
+    {
+        [self scheduleDataAvailable];
+    }
+
+    // Re-queue eof / error if they happened before registration.
+    if (fireEof || fireError)
+    {
+        [bufferLock lock];
+        eofScheduled = NO;
+        errorScheduled = NO;
+        [bufferLock unlock];
+
+        if (fireError)
+        {
+            [self didFailWithError:nil];
+        }
+        else if (fireEof)
+        {
+            [self didComplete];
+        }
+    }
+}
+
+-(BOOL) currentEpochIs:(uint64_t)epoch
+{
+    [bufferLock lock];
+    BOOL match = (epoch == notificationEpoch);
+    [bufferLock unlock];
+    return match;
 }
 
 @end

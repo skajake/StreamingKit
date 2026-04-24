@@ -1,11 +1,11 @@
 /**********************************************************************************
  AudioPlayer.m
- 
+
  Created by Thong Nguyen on 14/05/2012.
  https://github.com/tumtumtum/audjustable
- 
+
  Copyright (c) 2012 Thong Nguyen (tumtumtum@gmail.com). All rights reserved.
- 
+
  Redistribution and use in source and binary forms, with or without
  modification, are permitted provided that the following conditions are met:
  1. Redistributions of source code must retain the above copyright
@@ -19,7 +19,7 @@
  4. Neither the name of Thong Nguyen nor the
  names of its contributors may be used to endorse or promote products
  derived from this software without specific prior written permission.
- 
+
  THIS SOFTWARE IS PROVIDED BY Thong Nguyen ''AS IS'' AND ANY
  EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
@@ -39,6 +39,8 @@
     SInt64 position;
     SInt64 length;
     AudioFileTypeID audioFileTypeHint;
+    NSFileHandle* fileHandle;
+    BOOL eofReached;
 }
 @property (readwrite, copy) NSString* filePath;
 -(void) open;
@@ -52,10 +54,10 @@
     if (self = [super init])
     {
         self.filePath = filePathIn;
-        
+
         audioFileTypeHint = [STKLocalFileDataSource audioFileTypeHintFromFileExtension:filePathIn.pathExtension];
     }
-    
+
     return self;
 }
 
@@ -63,7 +65,7 @@
 {
     static dispatch_once_t onceToken;
     static NSDictionary* fileTypesByFileExtensions;
-    
+
     dispatch_once(&onceToken, ^
     {
         fileTypesByFileExtensions =
@@ -80,14 +82,14 @@
             @"3gp": @(kAudioFile3GPType)
         };
     });
-    
+
     NSNumber* number = [fileTypesByFileExtensions objectForKey:fileExtension];
-    
+
     if (!number)
     {
         return 0;
     }
-    
+
     return (AudioFileTypeID)number.intValue;
 }
 
@@ -103,54 +105,61 @@
 
 -(void) close
 {
-    if (stream)
+    if (fileHandle)
     {
-        [self unregisterForEvents];
-
-        CFReadStreamClose(stream);
-        
-        stream = 0;
+        [fileHandle closeFile];
+        fileHandle = nil;
     }
+    [super close];
 }
 
 -(void) open
 {
-    if (stream)
+    if (fileHandle)
     {
-        [self unregisterForEvents];
-        
-        CFReadStreamClose(stream);
-        CFRelease(stream);
-        
-        stream = 0;
+        [fileHandle closeFile];
+        fileHandle = nil;
     }
-    
-    NSURL* url = [[NSURL alloc] initFileURLWithPath:self.filePath];
-    
-    stream = CFReadStreamCreateWithFile(NULL, (__bridge CFURLRef)url);
-    
-    NSError* fileError;
+
+    eofReached = NO;
+
+    fileHandle = [NSFileHandle fileHandleForReadingAtPath:self.filePath];
+
+    if (fileHandle == nil)
+    {
+        [self didFailWithError:nil];
+        return;
+    }
+
+    NSError* fileError = nil;
     NSFileManager* manager = [[NSFileManager alloc] init];
     NSDictionary* attributes = [manager attributesOfItemAtPath:filePath error:&fileError];
 
     if (fileError)
     {
-        CFReadStreamClose(stream);
-        CFRelease(stream);
-        stream = 0;
+        [fileHandle closeFile];
+        fileHandle = nil;
+        [self didFailWithError:fileError];
         return;
     }
 
-    NSNumber* number = [attributes objectForKey:@"NSFileSize"];
-    
+    NSNumber* number = [attributes objectForKey:NSFileSize];
+
     if (number)
     {
         length = number.longLongValue;
     }
-    
-    [self reregisterForEvents];
 
-    CFReadStreamOpen(stream);
+    [self didOpen];
+
+    if (position < length)
+    {
+        [self signalDataAvailable];
+    }
+    else
+    {
+        [self markEof];
+    }
 }
 
 -(SInt64) position
@@ -163,76 +172,114 @@
     return length;
 }
 
+-(BOOL) hasBytesAvailable
+{
+    if (fileHandle == nil)
+    {
+        return NO;
+    }
+    return position < length;
+}
+
 -(int) readIntoBuffer:(UInt8*)buffer withSize:(int)size
 {
-    int retval = (int)CFReadStreamRead(stream, buffer, size);
+    if (fileHandle == nil || size <= 0)
+    {
+        return 0;
+    }
 
-    if (retval > 0)
+    NSData* data = nil;
+    @try
     {
-        position += retval;
+        data = [fileHandle readDataOfLength:size];
     }
-    else
+    @catch (NSException* exception)
     {
-        NSNumber* property = (__bridge_transfer NSNumber*)CFReadStreamCopyProperty(stream, kCFStreamPropertyFileCurrentOffset);
-        
-        position = property.longLongValue;
+        return -1;
     }
-    
-    return retval;
+
+    int read = (int)data.length;
+
+    if (read > 0)
+    {
+        memcpy(buffer, data.bytes, read);
+        position += read;
+    }
+
+    if (position >= length && !eofReached)
+    {
+        [self markEof];
+    }
+    else if (read > 0 && position < length)
+    {
+        // Keep the run loop pumping until fully drained.
+        [self signalDataAvailable];
+    }
+
+    return read;
 }
 
 -(void) seekToOffset:(SInt64)offset
 {
-    CFStreamStatus status = kCFStreamStatusClosed;
-    
-    if (stream != 0)
+    if (fileHandle == nil)
     {
-		status = CFReadStreamGetStatus(stream);
-    }
-    
-    BOOL reopened = NO;
-    
-    if (status == kCFStreamStatusAtEnd || status == kCFStreamStatusClosed || status == kCFStreamStatusError)
-    {
-        reopened = YES;
-        
-        [self close];        
         [self open];
-    }
-    
-    if (stream == 0)
-    {
-        CFRunLoopPerformBlock(eventsRunLoop.getCFRunLoop, NSRunLoopCommonModes, ^
+        if (fileHandle == nil)
         {
-            [self errorOccured];
-        });
-        
-        CFRunLoopWakeUp(eventsRunLoop.getCFRunLoop);
-        
-        return;
+            return;
+        }
     }
-    
-    if (CFReadStreamSetProperty(stream, kCFStreamPropertyFileCurrentOffset, (__bridge CFTypeRef)[NSNumber numberWithLongLong:offset]) != TRUE)
+
+    @try
+    {
+        [fileHandle seekToFileOffset:(unsigned long long)offset];
+        position = offset;
+        eofReached = NO;
+    }
+    @catch (NSException* exception)
     {
         position = 0;
+        [self didFailWithError:nil];
+        return;
+    }
+
+    if (position < length)
+    {
+        [self signalDataAvailable];
     }
     else
     {
-        position = offset;
+        [self markEof];
     }
-    
-    if (!reopened)
+}
+
+// Local file I/O is synchronous — the base-class buffer isn't used. Feed a
+// zero-byte NSData so the base scheduler still wakes the run loop; the player
+// will then pull bytes directly through readIntoBuffer:.
+-(void) signalDataAvailable
+{
+    NSRunLoop* runLoop = eventsRunLoop;
+    if (runLoop == nil)
     {
-        CFRunLoopPerformBlock(eventsRunLoop.getCFRunLoop, NSRunLoopCommonModes, ^
-        {
-            if ([self hasBytesAvailable])
-            {
-                [self dataAvailable];
-            }
-        });
-        
-        CFRunLoopWakeUp(eventsRunLoop.getCFRunLoop);
+        return;
     }
+
+    CFRunLoopPerformBlock([runLoop getCFRunLoop], (__bridge CFStringRef)NSRunLoopCommonModes, ^
+    {
+        if (self->eventsRunLoop == nil) return;
+        [self dataAvailable];
+    });
+    CFRunLoopWakeUp([runLoop getCFRunLoop]);
+}
+
+-(void) markEof
+{
+    if (eofReached)
+    {
+        return;
+    }
+    eofReached = YES;
+    [self didComplete];
 }
 
 -(NSString*) description

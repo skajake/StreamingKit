@@ -355,11 +355,17 @@
     {
 		if (localRequestSerialNumber != self->requestSerialNumber)
 		{
+            NSLog(@"STKHTTPDataSource: URL callback superseded (got #%d, current #%d)", localRequestSerialNumber, self->requestSerialNumber);
 			return;
 		}
 
         if (url == nil)
         {
+            // The URL provider failed (e.g. a license fetch returned nothing).
+            // The audio player is waiting on us — surface the failure so it
+            // doesn't sit in a buffering state forever.
+            NSLog(@"STKHTTPDataSource: URL provider returned nil; emitting error");
+            [self didFailWithError:nil];
             return;
         }
 
@@ -369,11 +375,13 @@
         {
             if (localRequestSerialNumber != self->requestSerialNumber)
             {
+                NSLog(@"STKHTTPDataSource: queued setup superseded (got #%d, current #%d)", localRequestSerialNumber, self->requestSerialNumber);
                 return;
             }
 
             [self resetForRequest];
             self->currentUrl = url;
+            NSLog(@"STKHTTPDataSource: opening %@ (forSeek=%d, seekStart=%lld)", url.absoluteString, forSeek, self->seekStart);
             [self startConnectionToURL:url];
         });
     });
@@ -457,21 +465,32 @@
         }
         if (strongSelf->connection != conn)
         {
+            NSLog(@"STKHTTPDataSource: state %d on stale conn, ignoring", (int)state);
             return;
         }
 
         switch (state)
         {
+            case nw_connection_state_waiting:
+                NSLog(@"STKHTTPDataSource: waiting (likely no network) for %@", url.host);
+                break;
+            case nw_connection_state_preparing:
+                break;
             case nw_connection_state_ready:
             {
+                NSLog(@"STKHTTPDataSource: connection ready to %@", url.host);
                 NSData* requestData = [strongSelf buildRequestForURL:url];
                 [strongSelf sendRequest:requestData onConnection:conn];
                 [strongSelf receiveOnConnection:conn];
                 break;
             }
             case nw_connection_state_failed:
+            {
+                int errorCode = error ? nw_error_get_error_code(error) : 0;
+                NSLog(@"STKHTTPDataSource: connection failed for %@ (err=%d)", url.host, errorCode);
                 [strongSelf didFailWithError:nil];
                 break;
+            }
             case nw_connection_state_cancelled:
                 // Either we cancelled (teardown) or the failure path already
                 // emitted; nothing to do here.
@@ -481,6 +500,7 @@
         }
     });
 
+    NSLog(@"STKHTTPDataSource: starting connection to %@:%@ (tls=%d)", host, portString, isTLS);
     nw_connection_start(conn);
 }
 
@@ -608,11 +628,12 @@
             {
                 if (strongSelf->responseHeadParsed)
                 {
+                    NSLog(@"STKHTTPDataSource: stream ended for %@", strongSelf->currentUrl.host);
                     [strongSelf didComplete];
                 }
                 else
                 {
-                    // Server closed before we ever got a full response head.
+                    NSLog(@"STKHTTPDataSource: stream ended before head complete for %@ (head bytes so far: %lu)", strongSelf->currentUrl.host, (unsigned long)strongSelf->responseHeadBuffer.length);
                     [strongSelf didFailWithError:nil];
                 }
                 return;
@@ -689,9 +710,12 @@
     NSMutableDictionary* headers = [NSMutableDictionary new];
     if (![self parseHeadString:headStr statusCode:&statusCode headers:headers])
     {
+        NSLog(@"STKHTTPDataSource: failed to parse response head: %@", [headStr length] > 200 ? [headStr substringToIndex:200] : headStr);
         [self didFailWithError:nil];
         return;
     }
+
+    NSLog(@"STKHTTPDataSource: %@ -> %d", currentUrl.host, statusCode);
 
     responseHeadParsed = YES;
     responseHeadBuffer = nil;

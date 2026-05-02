@@ -299,20 +299,13 @@
 
     relativePosition = 0;
     dataBytesRead = 0;
+    seekStart = offset;
+
     self->isInErrorState = NO;
 
-    if (self->supportsSeek)
+    if (!self->supportsSeek && offset != self->relativePosition)
     {
-        seekStart = offset;
-    }
-    else
-    {
-        // Non-seekable (live) stream. The audio player's mid-stream recovery
-        // path (STKAudioPlayer readIntoBuffer == -1) issues
-        // seekToOffset:currentPosition to force a reopen — honour that as a
-        // reopen-from-zero rather than silently no-op'ing. Genuine user seeks
-        // are gated against supportsSeek upstream and never reach here.
-        seekStart = 0;
+        return;
     }
 
     [self openForSeek:YES];

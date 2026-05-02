@@ -22,6 +22,8 @@ let package = Package(
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("SystemConfiguration"),
                 .linkedFramework("CoreFoundation"),
+                .linkedFramework("Network"),
+                .linkedFramework("Security"),
                 .linkedFramework("AudioUnit", .when(platforms: [.macOS]))
             ]
         )

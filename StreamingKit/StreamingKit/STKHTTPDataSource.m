@@ -34,8 +34,15 @@
 
 #import "STKHTTPDataSource.h"
 #import "STKLocalFileDataSource.h"
+#import <Network/Network.h>
 
-@interface STKHTTPDataSource() <NSURLSessionDataDelegate>
+// Hard caps so a malformed server can't grow our head buffer or redirect chain
+// without bound.
+#define STK_HTTP_HEAD_LIMIT      (64 * 1024)
+#define STK_HTTP_MAX_REDIRECTS   5
+#define STK_HTTP_RECEIVE_MAX     65536
+
+@interface STKHTTPDataSource()
 {
 @private
     BOOL supportsSeek;
@@ -52,9 +59,11 @@
     AudioFileTypeID audioFileTypeHint;
     NSDictionary* requestHeaders;
 
-    NSURLSession* urlSession;
-    NSURLSessionDataTask* dataTask;
-    NSOperationQueue* delegateQueue;
+    nw_connection_t connection;
+    dispatch_queue_t connectionQueue;
+    NSMutableData* responseHeadBuffer;
+    BOOL responseHeadParsed;
+    int redirectCount;
 
     // Meta data
     BOOL metaDataPresent;
@@ -105,9 +114,7 @@
 
         metaDataString = [NSMutableString new];
 
-        delegateQueue = [[NSOperationQueue alloc] init];
-        delegateQueue.maxConcurrentOperationCount = 1;
-        delegateQueue.name = @"com.streamingkit.httpdatasource";
+        connectionQueue = dispatch_queue_create("com.streamingkit.httpdatasource", DISPATCH_QUEUE_SERIAL);
     }
 
     return self;
@@ -117,7 +124,7 @@
 {
     NSLog(@"STKHTTPDataSource dealloc");
 
-    [self teardownSession];
+    [self teardownConnection];
 }
 
 -(NSURL*) url
@@ -162,7 +169,15 @@
         };
     });
 
-    NSNumber* number = [fileTypesByMimeType objectForKey:mimeType];
+    NSString* lookupKey = mimeType;
+    NSRange semi = [mimeType rangeOfString:@";"];
+    if (semi.location != NSNotFound)
+    {
+        lookupKey = [mimeType substringToIndex:semi.location];
+    }
+    lookupKey = [[lookupKey stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]] lowercaseString];
+
+    NSNumber* number = [fileTypesByMimeType objectForKey:lookupKey];
 
     if (!number)
     {
@@ -179,35 +194,28 @@
 
 -(id) headerValueForKey:(NSString*)key
 {
-    // NSHTTPURLResponse.allHeaderFields keys are typically canonicalised but
-    // the spec says header lookup is case-insensitive; keep a defensive double
-    // lookup that preserves the old dual-case behaviour.
-    id value = [httpHeaders objectForKey:key];
-    if (value != nil)
-    {
-        return value;
-    }
+    // Headers are stored lowercase by the parser; do a case-insensitive lookup.
     return [httpHeaders objectForKey:[key lowercaseString]];
 }
 
--(void) applyResponseHeaders:(NSHTTPURLResponse*)response
+-(void) applyParsedStatus:(int)statusCode headers:(NSDictionary*)headers
 {
-    self->httpStatusCode = (UInt32)response.statusCode;
-    self->httpHeaders = response.allHeaderFields;
+    self->httpStatusCode = (UInt32)statusCode;
+    self->httpHeaders = headers;
 
     if ([self headerValueForKey:@"Accept-Ranges"] != nil)
     {
         self->supportsSeek = YES;
     }
 
-    NSString* metaInt = [self headerValueForKey:@"icy-metaint"] ?: [self headerValueForKey:@"Icy-Metaint"];
+    NSString* metaInt = [self headerValueForKey:@"icy-metaint"];
     if (metaInt.length > 0)
     {
         metaDataPresent = YES;
         metaDataInterval = (unsigned int)[metaInt intValue];
     }
 
-    if (self.httpStatusCode == 200)
+    if (statusCode == 200)
     {
         if (seekStart == 0)
         {
@@ -223,7 +231,7 @@
             audioFileTypeHint = typeIdFromMimeType;
         }
     }
-    else if (self.httpStatusCode == 206)
+    else if (statusCode == 206)
     {
         NSString* contentRange = [self headerValueForKey:@"Content-Range"];
         NSArray* components = [contentRange componentsSeparatedByString:@"/"];
@@ -245,24 +253,26 @@
     return fileLength >= 0 ? fileLength : 0;
 }
 
--(void) teardownSession
+-(void) teardownConnection
 {
-    if (dataTask)
-    {
-        [dataTask cancel];
-        dataTask = nil;
-    }
+    nw_connection_t toCancel = self->connection;
+    self->connection = nil;
 
-    if (urlSession)
+    if (toCancel)
     {
-        [urlSession invalidateAndCancel];
-        urlSession = nil;
+        // Cancel on the connection queue so any in-flight callbacks finish
+        // first; once cancelled, the state handler block is released, taking
+        // the connection's last retain with it.
+        dispatch_async(connectionQueue, ^
+        {
+            nw_connection_cancel(toCancel);
+        });
     }
 }
 
 -(void) close
 {
-    [self teardownSession];
+    [self teardownConnection];
     [super close];
 }
 
@@ -348,54 +358,465 @@
 			return;
 		}
 
-        self->currentUrl = url;
-
         if (url == nil)
         {
             return;
         }
 
-        [self resetBuffer];
-
-        NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:url];
-        request.HTTPMethod = @"GET";
-        request.networkServiceType = NSURLNetworkServiceTypeBackground;
-
-        if (self->seekStart > 0 && self->supportsSeek)
+        // Move all setup onto the connection queue so connection state is only
+        // ever touched from one thread.
+        dispatch_async(self->connectionQueue, ^
         {
-            [request setValue:[NSString stringWithFormat:@"bytes=%lld-", self->seekStart] forHTTPHeaderField:@"Range"];
+            if (localRequestSerialNumber != self->requestSerialNumber)
+            {
+                return;
+            }
 
-            self->discontinuous = YES;
-        }
-
-        for (NSString* key in self->requestHeaders)
-        {
-            NSString* value = [self->requestHeaders objectForKey:key];
-
-            [request setValue:value forHTTPHeaderField:key];
-        }
-
-        [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-        [request setValue:@"0" forHTTPHeaderField:@"Ice-MetaData"];
-        [request setValue:@"1" forHTTPHeaderField:@"icy-metadata"];
-
-        NSURLSessionConfiguration* config = [NSURLSessionConfiguration defaultSessionConfiguration];
-        // Default config already picks up system proxy settings.
-
-        self->urlSession = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:self->delegateQueue];
-
-        self->httpStatusCode = 0;
-        self->httpHeaders = nil;
-        self->metaDataPresent = NO;
-        self->metaDataInterval = 0;
-        self->metaDataBytesRemaining = 0;
-        self->dataBytesRead = 0;
-
-        self->dataTask = [self->urlSession dataTaskWithRequest:request];
-        [self->dataTask resume];
-
-        self->isInErrorState = NO;
+            [self resetForRequest];
+            self->currentUrl = url;
+            [self startConnectionToURL:url];
+        });
     });
+}
+
+-(void) resetForRequest
+{
+    [self resetBuffer];
+    self->httpStatusCode = 0;
+    self->httpHeaders = nil;
+    self->metaDataPresent = NO;
+    self->metaDataInterval = 0;
+    self->metaDataBytesRemaining = 0;
+    self->dataBytesRead = 0;
+    self->responseHeadBuffer = [[NSMutableData alloc] init];
+    self->responseHeadParsed = NO;
+    self->redirectCount = 0;
+    self->isInErrorState = NO;
+}
+
+-(void) startConnectionToURL:(NSURL*)url
+{
+    NSString* scheme = [url.scheme lowercaseString];
+    BOOL isTLS = [scheme isEqualToString:@"https"];
+
+    if (!isTLS && ![scheme isEqualToString:@"http"])
+    {
+        [self didFailWithError:nil];
+        return;
+    }
+
+    NSString* host = url.host;
+    if (host.length == 0)
+    {
+        [self didFailWithError:nil];
+        return;
+    }
+
+    int port = url.port ? url.port.intValue : (isTLS ? 443 : 80);
+    NSString* portString = [NSString stringWithFormat:@"%d", port];
+
+    nw_endpoint_t endpoint = nw_endpoint_create_host([host UTF8String], [portString UTF8String]);
+
+    nw_parameters_configure_protocol_block_t tlsConfig;
+    if (isTLS)
+    {
+        tlsConfig = ^(nw_protocol_options_t tls_options)
+        {
+            sec_protocol_options_t sec_options = nw_tls_copy_sec_protocol_options(tls_options);
+            // Match the legacy CFStream behaviour of
+            // kCFStreamSSLValidatesCertificateChain = NO. Streaming radio
+            // servers commonly present self-signed or hostname-mismatched
+            // certs; the original library accepted them.
+            sec_protocol_options_set_verify_block(sec_options,
+                ^(sec_protocol_metadata_t metadata, sec_trust_t trust_ref, sec_protocol_verify_complete_t complete)
+                {
+                    complete(true);
+                },
+                dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0));
+        };
+    }
+    else
+    {
+        tlsConfig = NW_PARAMETERS_DISABLE_PROTOCOL;
+    }
+
+    nw_parameters_t parameters = nw_parameters_create_secure_tcp(tlsConfig, NW_PARAMETERS_DEFAULT_CONFIGURATION);
+    nw_parameters_set_service_class(parameters, nw_service_class_background);
+
+    nw_connection_t conn = nw_connection_create(endpoint, parameters);
+    self->connection = conn;
+    nw_connection_set_queue(conn, connectionQueue);
+
+    __weak STKHTTPDataSource* weakSelf = self;
+    nw_connection_set_state_changed_handler(conn, ^(nw_connection_state_t state, nw_error_t error)
+    {
+        STKHTTPDataSource* strongSelf = weakSelf;
+        if (!strongSelf)
+        {
+            return;
+        }
+        if (strongSelf->connection != conn)
+        {
+            return;
+        }
+
+        switch (state)
+        {
+            case nw_connection_state_ready:
+            {
+                NSData* requestData = [strongSelf buildRequestForURL:url];
+                [strongSelf sendRequest:requestData onConnection:conn];
+                [strongSelf receiveOnConnection:conn];
+                break;
+            }
+            case nw_connection_state_failed:
+                [strongSelf didFailWithError:nil];
+                break;
+            case nw_connection_state_cancelled:
+                // Either we cancelled (teardown) or the failure path already
+                // emitted; nothing to do here.
+                break;
+            default:
+                break;
+        }
+    });
+
+    nw_connection_start(conn);
+}
+
+-(NSData*) buildRequestForURL:(NSURL*)url
+{
+    // NSURL.path is percent-decoded; the wire form has to keep percent encoding.
+    NSURLComponents* components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    NSString* path = components.percentEncodedPath;
+    if (path.length == 0)
+    {
+        path = @"/";
+    }
+    NSString* query = components.percentEncodedQuery;
+    if (query.length > 0)
+    {
+        path = [path stringByAppendingFormat:@"?%@", query];
+    }
+
+    NSMutableString* request = [NSMutableString string];
+    [request appendFormat:@"GET %@ HTTP/1.0\r\n", path];
+
+    NSString* hostHeader = url.host;
+    NSNumber* portNum = url.port;
+    BOOL isDefaultPort = (portNum == nil) ||
+        ([url.scheme.lowercaseString isEqualToString:@"http"] && portNum.intValue == 80) ||
+        ([url.scheme.lowercaseString isEqualToString:@"https"] && portNum.intValue == 443);
+    if (!isDefaultPort)
+    {
+        hostHeader = [NSString stringWithFormat:@"%@:%@", url.host, portNum];
+    }
+    [request appendFormat:@"Host: %@\r\n", hostHeader];
+
+    if (self->seekStart > 0 && self->supportsSeek)
+    {
+        [request appendFormat:@"Range: bytes=%lld-\r\n", self->seekStart];
+        self->discontinuous = YES;
+    }
+
+    BOOL hasUserAgent = NO;
+    for (NSString* key in self->requestHeaders)
+    {
+        NSString* value = [self->requestHeaders objectForKey:key];
+        [request appendFormat:@"%@: %@\r\n", key, value];
+        if ([key caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame)
+        {
+            hasUserAgent = YES;
+        }
+    }
+
+    // SHOUTcast servers commonly reject requests without a User-Agent. The old
+    // CFStream path got away without one; be defensive here.
+    if (!hasUserAgent)
+    {
+        [request appendString:@"User-Agent: StreamingKit\r\n"];
+    }
+
+    [request appendString:@"Accept: */*\r\n"];
+    [request appendString:@"Ice-MetaData: 0\r\n"];
+    [request appendString:@"icy-metadata: 1\r\n"];
+    [request appendString:@"\r\n"];
+
+    return [request dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+-(void) sendRequest:(NSData*)data onConnection:(nw_connection_t)conn
+{
+    if (data.length == 0)
+    {
+        return;
+    }
+
+    // DISPATCH_DATA_DESTRUCTOR_DEFAULT copies the bytes, so we don't have to
+    // keep `data` alive ourselves.
+    dispatch_data_t payload = dispatch_data_create(data.bytes, data.length,
+        connectionQueue, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+
+    __weak STKHTTPDataSource* weakSelf = self;
+    nw_connection_send(conn, payload, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true,
+        ^(nw_error_t sendError)
+        {
+            if (sendError == NULL)
+            {
+                return;
+            }
+            STKHTTPDataSource* strongSelf = weakSelf;
+            if (!strongSelf || strongSelf->connection != conn)
+            {
+                return;
+            }
+            [strongSelf didFailWithError:nil];
+        });
+}
+
+-(void) receiveOnConnection:(nw_connection_t)conn
+{
+    __weak STKHTTPDataSource* weakSelf = self;
+    nw_connection_receive(conn, 1, STK_HTTP_RECEIVE_MAX,
+        ^(dispatch_data_t content, nw_content_context_t context, bool is_complete, nw_error_t receive_error)
+        {
+            STKHTTPDataSource* strongSelf = weakSelf;
+            if (!strongSelf || strongSelf->connection != conn)
+            {
+                return;
+            }
+
+            if (content && dispatch_data_get_size(content) > 0)
+            {
+                NSData* received = [strongSelf nsDataFromDispatchData:content];
+                [strongSelf processReceivedData:received];
+                if (strongSelf->connection != conn)
+                {
+                    // processReceivedData may have torn the connection down
+                    // (e.g. redirect or 4xx) — bail out before re-arming.
+                    return;
+                }
+            }
+
+            if (receive_error)
+            {
+                [strongSelf didFailWithError:nil];
+                return;
+            }
+
+            if (is_complete)
+            {
+                if (strongSelf->responseHeadParsed)
+                {
+                    [strongSelf didComplete];
+                }
+                else
+                {
+                    // Server closed before we ever got a full response head.
+                    [strongSelf didFailWithError:nil];
+                }
+                return;
+            }
+
+            [strongSelf receiveOnConnection:conn];
+        });
+}
+
+-(NSData*) nsDataFromDispatchData:(dispatch_data_t)data
+{
+    size_t size = dispatch_data_get_size(data);
+    NSMutableData* result = [NSMutableData dataWithCapacity:size];
+    dispatch_data_apply(data, ^bool(dispatch_data_t region, size_t offset, const void* buffer, size_t blockSize)
+    {
+        [result appendBytes:buffer length:blockSize];
+        return true;
+    });
+    return result;
+}
+
+-(void) processReceivedData:(NSData*)data
+{
+    if (responseHeadParsed)
+    {
+        [self didReceiveData:data];
+        return;
+    }
+
+    [responseHeadBuffer appendData:data];
+
+    static NSData* terminator = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^
+    {
+        terminator = [@"\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding];
+    });
+
+    NSRange range = [responseHeadBuffer rangeOfData:terminator
+                                            options:0
+                                              range:NSMakeRange(0, responseHeadBuffer.length)];
+
+    if (range.location == NSNotFound)
+    {
+        if (responseHeadBuffer.length > STK_HTTP_HEAD_LIMIT)
+        {
+            [self didFailWithError:nil];
+        }
+        return;
+    }
+
+    NSUInteger headEnd = range.location + range.length;
+    NSData* headData = [responseHeadBuffer subdataWithRange:NSMakeRange(0, range.location)];
+    NSData* bodyTail = nil;
+    if (headEnd < responseHeadBuffer.length)
+    {
+        bodyTail = [responseHeadBuffer subdataWithRange:NSMakeRange(headEnd, responseHeadBuffer.length - headEnd)];
+    }
+
+    NSString* headStr = [[NSString alloc] initWithData:headData encoding:NSUTF8StringEncoding];
+    if (!headStr)
+    {
+        // Fall back to a permissive 8-bit encoding — header bytes should be
+        // ASCII but some misbehaving servers slip in non-UTF-8 characters.
+        headStr = [[NSString alloc] initWithData:headData encoding:NSISOLatin1StringEncoding];
+    }
+    if (!headStr)
+    {
+        [self didFailWithError:nil];
+        return;
+    }
+
+    int statusCode = 0;
+    NSMutableDictionary* headers = [NSMutableDictionary new];
+    if (![self parseHeadString:headStr statusCode:&statusCode headers:headers])
+    {
+        [self didFailWithError:nil];
+        return;
+    }
+
+    responseHeadParsed = YES;
+    responseHeadBuffer = nil;
+
+    // Redirect handling. Per RFC, only 3xx with a Location header redirects;
+    // we follow up to STK_HTTP_MAX_REDIRECTS to mirror CFNetwork's behaviour.
+    if (statusCode >= 300 && statusCode < 400)
+    {
+        NSString* location = headers[@"location"];
+        if (location.length > 0 && redirectCount < STK_HTTP_MAX_REDIRECTS)
+        {
+            redirectCount++;
+            NSURL* nextUrl = [NSURL URLWithString:location relativeToURL:currentUrl];
+            if (nextUrl != nil)
+            {
+                // Reuse this same data source; tear down the current
+                // connection and start the next one.
+                nw_connection_t toCancel = self->connection;
+                self->connection = nil;
+                if (toCancel)
+                {
+                    nw_connection_cancel(toCancel);
+                }
+
+                self->httpStatusCode = 0;
+                self->httpHeaders = nil;
+                self->metaDataPresent = NO;
+                self->metaDataInterval = 0;
+                self->metaDataBytesRemaining = 0;
+                self->dataBytesRead = 0;
+                self->responseHeadBuffer = [[NSMutableData alloc] init];
+                self->responseHeadParsed = NO;
+
+                self->currentUrl = nextUrl;
+                [self startConnectionToURL:nextUrl];
+                return;
+            }
+        }
+
+        [self applyParsedStatus:statusCode headers:headers];
+        [self didFailWithError:nil];
+        return;
+    }
+
+    [self applyParsedStatus:statusCode headers:headers];
+
+    if (statusCode == 416)
+    {
+        if (self.length >= 0)
+        {
+            seekStart = self.length;
+        }
+        [self didComplete];
+        return;
+    }
+
+    if (statusCode >= 400)
+    {
+        [self didFailWithError:nil];
+        return;
+    }
+
+    [self didOpen];
+
+    if (bodyTail.length > 0)
+    {
+        [self didReceiveData:bodyTail];
+    }
+}
+
+-(BOOL) parseHeadString:(NSString*)headStr
+             statusCode:(int*)outStatus
+                headers:(NSMutableDictionary*)outHeaders
+{
+    NSArray* lines = [headStr componentsSeparatedByString:@"\r\n"];
+    if (lines.count == 0)
+    {
+        return NO;
+    }
+
+    NSString* statusLine = lines[0];
+    // First token is the protocol — "HTTP/1.x" for normal HTTP, or "ICY" for
+    // SHOUTcast 1.x servers. Accept both.
+    NSRange firstSpace = [statusLine rangeOfString:@" "];
+    if (firstSpace.location == NSNotFound)
+    {
+        return NO;
+    }
+    NSString* protocol = [statusLine substringToIndex:firstSpace.location];
+    NSString* rest = [statusLine substringFromIndex:firstSpace.location + 1];
+
+    BOOL validProtocol = [protocol hasPrefix:@"HTTP/"] ||
+        [protocol caseInsensitiveCompare:@"ICY"] == NSOrderedSame;
+    if (!validProtocol)
+    {
+        return NO;
+    }
+
+    NSRange secondSpace = [rest rangeOfString:@" "];
+    NSString* codeString = secondSpace.location == NSNotFound ? rest : [rest substringToIndex:secondSpace.location];
+    int code = [codeString intValue];
+    if (code == 0)
+    {
+        return NO;
+    }
+    *outStatus = code;
+
+    for (NSUInteger i = 1; i < lines.count; i++)
+    {
+        NSString* line = lines[i];
+        if (line.length == 0)
+        {
+            continue;
+        }
+        NSRange colonRange = [line rangeOfString:@":"];
+        if (colonRange.location == NSNotFound)
+        {
+            continue;
+        }
+        NSString* key = [[line substringToIndex:colonRange.location] lowercaseString];
+        NSString* value = [[line substringFromIndex:colonRange.location + 1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        outHeaders[key] = value;
+    }
+
+    return YES;
 }
 
 -(UInt32) httpStatusCode
@@ -416,124 +837,6 @@
 -(BOOL) supportsSeek
 {
     return self->supportsSeek;
-}
-
-#pragma mark - NSURLSessionDataDelegate
-
--(void) URLSession:(NSURLSession *)session
-          dataTask:(NSURLSessionDataTask *)task
-didReceiveResponse:(NSURLResponse *)response
- completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler
-{
-    if (task != self->dataTask)
-    {
-        completionHandler(NSURLSessionResponseCancel);
-        return;
-    }
-
-    if (![response isKindOfClass:[NSHTTPURLResponse class]])
-    {
-        completionHandler(NSURLSessionResponseAllow);
-        return;
-    }
-
-    NSHTTPURLResponse* httpResponse = (NSHTTPURLResponse*)response;
-    [self applyResponseHeaders:httpResponse];
-
-    if (self.httpStatusCode == 416)
-    {
-        if (self.length >= 0)
-        {
-            seekStart = self.length;
-        }
-
-        completionHandler(NSURLSessionResponseCancel);
-        [self didComplete];
-        return;
-    }
-
-    if (self.httpStatusCode >= 300)
-    {
-        completionHandler(NSURLSessionResponseCancel);
-        [self didFailWithError:nil];
-        return;
-    }
-
-    [self didOpen];
-    completionHandler(NSURLSessionResponseAllow);
-}
-
--(void) URLSession:(NSURLSession *)session
-          dataTask:(NSURLSessionDataTask *)task
-    didReceiveData:(NSData *)data
-{
-    if (task != self->dataTask)
-    {
-        return;
-    }
-
-    [self didReceiveData:data];
-}
-
--(void) URLSession:(NSURLSession *)session
-              task:(NSURLSessionTask *)task
-didCompleteWithError:(NSError *)error
-{
-    if (task != self->dataTask)
-    {
-        return;
-    }
-
-    if (error)
-    {
-        // -999 is NSURLErrorCancelled — we cancelled ourselves for seek/reconnect.
-        if (error.code == NSURLErrorCancelled && [error.domain isEqualToString:NSURLErrorDomain])
-        {
-            return;
-        }
-
-        [self didFailWithError:error];
-    }
-    else
-    {
-        [self didComplete];
-    }
-}
-
--(void) URLSession:(NSURLSession *)session
-              task:(NSURLSessionTask *)task
-willPerformHTTPRedirection:(NSHTTPURLResponse *)response
-        newRequest:(NSURLRequest *)request
- completionHandler:(void (^)(NSURLRequest * _Nullable))completionHandler
-{
-    if (task != self->dataTask)
-    {
-        completionHandler(nil);
-        return;
-    }
-
-    self->currentUrl = request.URL;
-    completionHandler(request);
-}
-
--(void) URLSession:(NSURLSession *)session
-didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
- completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential * _Nullable))completionHandler
-{
-    // Match the legacy behaviour of kCFStreamSSLValidatesCertificateChain = NO:
-    // trust whatever the server presents.
-    if ([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust])
-    {
-        SecTrustRef serverTrust = challenge.protectionSpace.serverTrust;
-        if (serverTrust != NULL)
-        {
-            NSURLCredential* credential = [NSURLCredential credentialForTrust:serverTrust];
-            completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
-            return;
-        }
-    }
-
-    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
 }
 
 #pragma mark - Meta data

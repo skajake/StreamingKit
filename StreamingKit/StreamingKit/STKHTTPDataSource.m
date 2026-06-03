@@ -66,44 +66,10 @@
     BOOL foundIcyStart;
     BOOL foundIcyEnd;
     NSMutableString *metaDataString;      //  meta data string
-    UInt64 totalAudioBytesReceived;       // cumulative encoded audio bytes received (excludes ICY metadata bytes)
-    double parsedFrameBitrate;            // exact CBR bitrate (bits/sec) read from the first MP3 frame, 0 until found
 }
 -(void) open;
 
 @end
-
-// Minimal MP3 frame-header reader, just enough to recover the constant bitrate of a CBR stream so
-// we can convert "encoded audio bytes" into "seconds of audio" the same way the transcribe-service
-// does (see tbapps-k8s .../transcribe-service/src/mp3.ts). We do not decode anything.
-// An MP3 frame header is 4 bytes beginning with an 11-bit frame sync (all ones); the bitrate and
-// sample rate are looked up from tables keyed by the MPEG version and layer in the header.
-static double STKReadFirstMp3FrameBitrate(const UInt8 *buf, int length)
-{
-    // Layer III bitrate tables (kbps), indexed by the 4-bit bitrate field.
-    static const int kBitrateKbpsMpeg1L3[16]  = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0};
-    static const int kBitrateKbpsMpeg2L3[16]  = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0};
-
-    for (int i = 0; i + 4 <= length; i++) {
-        // Frame sync: 11 bits set (0xFF then top 3 bits of the next byte).
-        if (buf[i] != 0xFF || (buf[i + 1] & 0xE0) != 0xE0) continue;
-
-        int versionBits = (buf[i + 1] >> 3) & 0x03; // 3=MPEG1, 2=MPEG2, 0=MPEG2.5
-        int layerBits   = (buf[i + 1] >> 1) & 0x03; // 1 = Layer III
-        if (layerBits != 0x01) continue;            // Layer III only (streaming MP3)
-        if (versionBits == 0x01) continue;          // reserved version
-
-        int bitrateIndex    = (buf[i + 2] >> 4) & 0x0F;
-        int sampleRateIndex = (buf[i + 2] >> 2) & 0x03;
-        if (bitrateIndex == 0 || bitrateIndex == 0x0F) continue; // free/bad
-        if (sampleRateIndex == 0x03) continue;                   // reserved
-
-        int kbps = (versionBits == 3) ? kBitrateKbpsMpeg1L3[bitrateIndex] : kBitrateKbpsMpeg2L3[bitrateIndex];
-        if (kbps <= 0) continue;
-        return kbps * 1000.0;
-    }
-    return 0.0;
-}
 
 @implementation STKHTTPDataSource
 
@@ -535,14 +501,6 @@ static double STKReadFirstMp3FrameBitrate(const UInt8 *buf, int length)
 
 -(void) openForSeek:(BOOL)forSeek
 {
-    if (!forSeek)
-    {
-        // Fresh feed: restart the encoded-byte counter and re-detect the bitrate so the fingerprint
-        // offsets are measured from the start of this stream (mirrors the server's per-connection zero).
-        self->totalAudioBytesReceived = 0;
-        self->parsedFrameBitrate = 0;
-    }
-
 	int localRequestSerialNumber;
 	
 	requestSerialNumber++;
@@ -744,24 +702,7 @@ static double STKReadFirstMp3FrameBitrate(const UInt8 *buf, int length)
                 if (--metaDataBytesRemaining == 0) {
                     dataBytesRead = 0;
 
-                    // Cumulative encoded audio-byte offset of this metadata marker: audio bytes
-                    // emitted across all prior buffers plus the audio bytes that preceded the
-                    // metadata block in this buffer (metadata bytes are excluded). This mirrors the
-                    // transcribe-service demuxer's encodedAudioBytes so local fingerprints line up
-                    // with the server's.
-                    UInt64 audioByteOffset = totalAudioBytesReceived + (UInt64)audioDataByteCount;
-
-                    // Recover the stream's exact CBR bitrate from the first interval of audio so the
-                    // offset can be converted to seconds the same way the server does.
-                    if (parsedFrameBitrate <= 0 && audioDataByteCount > 0) {
-                        parsedFrameBitrate = STKReadFirstMp3FrameBitrate(buffer, audioDataByteCount);
-                    }
-
-                    NSMutableDictionary *metaDataDictionary = [[self dictionaryFromMetaData:metaDataString] mutableCopy];
-                    metaDataDictionary[@"__audioByteOffset"] = @(audioByteOffset);
-                    if (parsedFrameBitrate > 0) {
-                        metaDataDictionary[@"__frameBitrate"] = @(parsedFrameBitrate);
-                    }
+                    NSDictionary *metaDataDictionary = [self dictionaryFromMetaData:metaDataString];
                     [self.delegate dataSource:self didUpdateMetaData:metaDataDictionary bytes:(i - streamStart)];
                 }
 
@@ -789,9 +730,6 @@ static double STKReadFirstMp3FrameBitrate(const UInt8 *buf, int length)
             // we don't need those bytes any more, since we already examined them
             buffer[audioDataByteCount++] = buffer[i];
         }
-
-        // Track total encoded audio bytes so metadata markers in later buffers get an absolute offset.
-        totalAudioBytesReceived += (UInt64)audioDataByteCount;
 
         return audioDataByteCount;
 

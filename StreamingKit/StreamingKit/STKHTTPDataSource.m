@@ -66,7 +66,7 @@
     BOOL foundIcyStart;
     BOOL foundIcyEnd;
     NSMutableString *metaDataString;      //  meta data string
-    UInt64 connectionAudioBytes;          // encoded audio bytes received in the current connection (excludes ICY metadata)
+    UInt64 totalAudioBytesReceived;       // cumulative encoded audio bytes received (excludes ICY metadata bytes)
     double parsedFrameBitrate;            // exact CBR bitrate (bits/sec) read from the first MP3 frame, 0 until found
 }
 -(void) open;
@@ -535,12 +535,11 @@ static double STKReadFirstMp3FrameBitrate(const UInt8 *buf, int length)
 
 -(void) openForSeek:(BOOL)forSeek
 {
-    // Each (re)connection counts audio bytes from zero, so elapsedSeconds restarts per connection.
-    self->connectionAudioBytes = 0;
-
     if (!forSeek)
     {
-        // Fresh feed: re-detect the bitrate for this stream.
+        // Fresh feed: restart the encoded-byte counter and re-detect the bitrate so the fingerprint
+        // offsets are measured from the start of this stream (mirrors the server's per-connection zero).
+        self->totalAudioBytesReceived = 0;
         self->parsedFrameBitrate = 0;
     }
 
@@ -745,10 +744,12 @@ static double STKReadFirstMp3FrameBitrate(const UInt8 *buf, int length)
                 if (--metaDataBytesRemaining == 0) {
                     dataBytesRead = 0;
 
-                    // Encoded audio-byte offset of this metadata marker within the current connection
-                    // (metadata bytes excluded). Divided by the byte rate this is the seconds into the
-                    // stream the marker aligns with, the same way the transcribe-service computes it.
-                    UInt64 audioByteOffset = connectionAudioBytes + (UInt64)audioDataByteCount;
+                    // Cumulative encoded audio-byte offset of this metadata marker: audio bytes
+                    // emitted across all prior buffers plus the audio bytes that preceded the
+                    // metadata block in this buffer (metadata bytes are excluded). This mirrors the
+                    // transcribe-service demuxer's encodedAudioBytes so local fingerprints line up
+                    // with the server's.
+                    UInt64 audioByteOffset = totalAudioBytesReceived + (UInt64)audioDataByteCount;
 
                     // Recover the stream's exact CBR bitrate from the first interval of audio so the
                     // offset can be converted to seconds the same way the server does.
@@ -789,8 +790,8 @@ static double STKReadFirstMp3FrameBitrate(const UInt8 *buf, int length)
             buffer[audioDataByteCount++] = buffer[i];
         }
 
-        // Track audio bytes for this connection so markers in later buffers get the right offset.
-        connectionAudioBytes += (UInt64)audioDataByteCount;
+        // Track total encoded audio bytes so metadata markers in later buffers get an absolute offset.
+        totalAudioBytesReceived += (UInt64)audioDataByteCount;
 
         return audioDataByteCount;
 

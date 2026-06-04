@@ -2669,6 +2669,11 @@ OSStatus AudioConverterCallback(AudioConverterRef inAudioConverter, UInt32* ioNu
                 [self handleRecordingOfAudioPackets:framesToDecode audioBuffer:&localPcmBufferList.mBuffers[0]];
             }
 
+            if (status == 100 || status == 0)
+            {
+                [self tapDecodedAudio:framesToDecode audioBuffer:&localPcmBufferList.mBuffers[0]];
+            }
+
             if (status == 100)
             {
                 OSSpinLockLock(&pcmBufferSpinLock);
@@ -2714,6 +2719,11 @@ OSStatus AudioConverterCallback(AudioConverterRef inAudioConverter, UInt32* ioNu
             if ((status == 100 || status == 0) && recordAudioFileId && recordAudioConverterRef)
             {
                 [self handleRecordingOfAudioPackets:framesToDecode audioBuffer:&localPcmBufferList.mBuffers[0]];
+            }
+
+            if (status == 100 || status == 0)
+            {
+                [self tapDecodedAudio:framesToDecode audioBuffer:&localPcmBufferList.mBuffers[0]];
             }
             
             if (status == 100)
@@ -2763,6 +2773,11 @@ OSStatus AudioConverterCallback(AudioConverterRef inAudioConverter, UInt32* ioNu
             if ((status == 100 || status == 0) && recordAudioFileId && recordAudioConverterRef)
             {
                 [self handleRecordingOfAudioPackets:framesToDecode audioBuffer:&localPcmBufferList.mBuffers[0]];
+            }
+
+            if (status == 100 || status == 0)
+            {
+                [self tapDecodedAudio:framesToDecode audioBuffer:&localPcmBufferList.mBuffers[0]];
             }
             
             if (status == 100)
@@ -2857,6 +2872,34 @@ OSStatus AudioConverterCallback(AudioConverterRef inAudioConverter, UInt32* ioNu
             }
         }
     }
+}
+
+// Invoked from the decode thread (handleAudioPackets) right after a chunk is
+// decoded into the PCM buffer, i.e. ahead of playback. Hands the freshly
+// decoded PCM to decodedPCMFilter along with how many seconds of already-decoded
+// audio sit ahead of this chunk (the decode-vs-playback lead). pcmBufferUsedFrameCount
+// is read before this chunk's frames are added to it, so it is the lead to the
+// start of this chunk.
+- (void)tapDecodedAudio:(UInt32)frameCount audioBuffer:(AudioBuffer *)audioBuffer
+{
+    STKPCMFilter filter = self.decodedPCMFilter;
+
+    if (filter == nil || frameCount == 0)
+    {
+        return;
+    }
+
+    OSSpinLockLock(&pcmBufferSpinLock);
+    UInt32 framesAhead = pcmBufferUsedFrameCount;
+    OSSpinLockUnlock(&pcmBufferSpinLock);
+
+    double bufferedSecondsAhead = framesAhead / canonicalAudioStreamBasicDescription.mSampleRate;
+
+    filter(canonicalAudioStreamBasicDescription.mChannelsPerFrame,
+           canonicalAudioStreamBasicDescription.mBytesPerFrame,
+           frameCount,
+           audioBuffer->mData,
+           bufferedSecondsAhead);
 }
 
 static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags* ioActionFlags, const AudioTimeStamp* inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList* ioData)

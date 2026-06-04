@@ -111,6 +111,14 @@ STKAudioPlayerOptions;
 
 typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UInt32 frameCount, void* frames);
 
+/// Block invoked on the decode thread as soon as a chunk of audio is decoded
+/// into the PCM buffer, i.e. ahead of playback. `bufferedSecondsAhead` is how
+/// many seconds of already-decoded audio sit ahead of this chunk and must play
+/// before it is heard (the lead between decoding and playback). Unlike
+/// STKFrameFilter (which runs in the render callback, locked to playback), this
+/// lets a consumer process audio before it reaches the speakers.
+typedef void(^STKPCMFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UInt32 frameCount, void* frames, double bufferedSecondsAhead);
+
 @interface STKFrameFilterEntry : NSObject
 @property (readonly) NSString* name;
 @property (readonly) STKFrameFilter filter;
@@ -160,6 +168,10 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 @property (assign, readwrite) int channelCount;
 /// Returns an array of STKFrameFilterEntry objects representing the filters currently in use
 @property (readonly, nullable) NSArray* frameFilters;
+/// Optional tap invoked on the decode thread with freshly decoded PCM, ahead of
+/// playback. See STKPCMFilter. Set to nil to remove. The PCM is in the player's
+/// canonical format (interleaved signed 16-bit, 2 channels, 22050 Hz).
+@property (copy, nullable) STKPCMFilter decodedPCMFilter;
 /// Returns the items pending to be played (includes buffering and upcoming items but does not include the current item)
 @property (readonly) NSArray* pendingQueue;
 /// The number of items pending to be played (includes buffering and upcoming items but does not include the current item)

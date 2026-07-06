@@ -119,6 +119,14 @@ typedef void(^STKFrameFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UIn
 /// lets a consumer process audio before it reaches the speakers.
 typedef void(^STKPCMFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UInt32 frameCount, void* frames, double bufferedSecondsAhead);
 
+/// Block invoked synchronously on the playback thread with the raw,
+/// metadata-stripped stream bytes exactly as read from the data source, before
+/// they are parsed or decoded (i.e. the clean compressed MP3/AAC bytes with
+/// ICY metadata already removed). These bytes are byte-identical across
+/// clients connected to the same Icecast/Shoutcast mount. Invoked on the data
+/// path; implementations must only copy the bytes and return quickly.
+typedef void(^STKRawBytesFilter)(const UInt8* bytes, int length);
+
 @interface STKFrameFilterEntry : NSObject
 @property (readonly) NSString* name;
 @property (readonly) STKFrameFilter filter;
@@ -172,6 +180,11 @@ typedef void(^STKPCMFilter)(UInt32 channelsPerFrame, UInt32 bytesPerFrame, UInt3
 /// playback. See STKPCMFilter. Set to nil to remove. The PCM is in the player's
 /// canonical format (interleaved signed 16-bit, 2 channels, 22050 Hz).
 @property (copy, nullable) STKPCMFilter decodedPCMFilter;
+/// Optional tap invoked with clean compressed stream bytes as they arrive from
+/// the data source, ahead of parse/decode. Fires for the entry currently being
+/// read (equals the playing entry unless items are queued). See
+/// STKRawBytesFilter. Set to nil to remove.
+@property (copy, nullable) STKRawBytesFilter rawAudioBytesFilter;
 /// Returns the items pending to be played (includes buffering and upcoming items but does not include the current item)
 @property (readonly) NSArray* pendingQueue;
 /// The number of items pending to be played (includes buffering and upcoming items but does not include the current item)

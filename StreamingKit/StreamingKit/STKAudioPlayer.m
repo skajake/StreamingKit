@@ -1583,10 +1583,17 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         SInt64 position = currentlyReadingEntry.dataSource.position;
         
         [currentlyReadingEntry.dataSource seekToOffset:position];
-        
+
         return;
     }
-    
+
+    STKRawBytesFilter rawBytesFilter = self.rawAudioBytesFilter;
+
+    if (rawBytesFilter != nil)
+    {
+        rawBytesFilter(readBuffer, read);
+    }
+
     int flags = 0;
     
     if (discontinuous)

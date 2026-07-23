@@ -90,6 +90,9 @@ typedef struct
     BOOL flushQueueOnSeek;
     /// If YES then volume control will be enabled on iOS
     BOOL enableVolumeMixer;
+    /// If YES an AUNewTimePitch node is included in the audio graph so
+    /// playbackRate can be adjusted (pitch-preserving). Off by default.
+    BOOL enableTimePitch;
     /// A pointer to a 0 terminated array of band frequencies (iOS 5.0 and later, OSX 10.9 and later)
     Float32 equalizerBandFrequencies[24];
 	/// The size of the internal I/O read buffer. This data in this buffer is transient and does not need to be larger.
@@ -185,6 +188,13 @@ typedef void(^STKRawBytesFilter)(const UInt8* bytes, int length);
 /// read (equals the playing entry unless items are queued). See
 /// STKRawBytesFilter. Set to nil to remove.
 @property (copy, nullable) STKRawBytesFilter rawAudioBytesFilter;
+/// Seconds of decoded PCM currently buffered ahead of playback (ring
+/// occupancy). Thread-safe; readable from any thread.
+@property (readonly) double bufferedSecondsAhead;
+/// Gets or sets the playback rate (pitch preserved). Only effective when
+/// options.enableTimePitch was set at creation; otherwise setting it is a
+/// no-op. Clamped to 0.5-2.0. Default is 1.0.
+@property (readwrite) float playbackRate;
 /// Returns the items pending to be played (includes buffering and upcoming items but does not include the current item)
 @property (readonly) NSArray* pendingQueue;
 /// The number of items pending to be played (includes buffering and upcoming items but does not include the current item)
@@ -253,6 +263,13 @@ typedef void(^STKRawBytesFilter)(const UInt8* bytes, int length);
 
 /// Seeks to a specific time (in seconds)
 -(void) seekToTime:(double)value;
+
+/// Discards up to `seconds` of decoded PCM from the front of the buffer and
+/// advances `progress` by the same amount, skipping the audio without playing
+/// it. Capped at the current occupancy minus a ~1 second guard so playback
+/// never underruns. Returns the seconds actually discarded. Intended for live
+/// streams (catching back up to the live edge); callable from any thread.
+-(double) discardBufferedSeconds:(double)seconds;
 
 /// Clears any upcoming items already queued for playback (does not stop the current item).
 /// The didCancelItems event will be raised for the items removed from the queue.

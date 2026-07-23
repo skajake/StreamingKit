@@ -197,12 +197,16 @@ STKAudioPlayerInternalState;
 
 #pragma mark STKAudioPlayer
 
-static UInt32 maxFramesPerSlice = 4096;
+// 8192 (not 4096): with the screen off RemoteIO renders 4096-frame slices, and
+// at playbackRate > 1 the time-pitch node pulls more than one slice's worth of
+// frames from its upstream per render pass.
+static UInt32 maxFramesPerSlice = 8192;
 
 static AudioComponentDescription mixerDescription;
 static AudioComponentDescription nbandUnitDescription;
 static AudioComponentDescription outputUnitDescription;
 static AudioComponentDescription convertUnitDescription;
+static AudioComponentDescription timePitchDescription;
 static AudioStreamBasicDescription canonicalAudioStreamBasicDescription;
 static AudioStreamBasicDescription recordAudioStreamBasicDescription;
 
@@ -229,6 +233,7 @@ static AudioStreamBasicDescription recordAudioStreamBasicDescription;
     AUNode eqNode;
 	AUNode mixerNode;
     AUNode outputNode;
+    AUNode timePitchNode;
 	
 	AUNode eqInputNode;
 	AUNode eqOutputNode;
@@ -238,6 +243,8 @@ static AudioStreamBasicDescription recordAudioStreamBasicDescription;
     AudioComponentInstance eqUnit;
 	AudioComponentInstance mixerUnit;
 	AudioComponentInstance outputUnit;
+    AudioComponentInstance timePitchUnit;
+    Float32 playbackRate;
 		
     UInt32 eqBandCount;
     int32_t waitingForDataAfterSeekFrameCount;
@@ -383,6 +390,15 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 		.componentSubType = kAudioUnitSubType_NBandEQ,
 		.componentManufacturer=kAudioUnitManufacturer_Apple
 	};
+
+    timePitchDescription = (AudioComponentDescription)
+    {
+        .componentType = kAudioUnitType_FormatConverter,
+        .componentSubType = kAudioUnitSubType_NewTimePitch,
+        .componentFlags = 0,
+        .componentFlagsMask = 0,
+        .componentManufacturer = kAudioUnitManufacturer_Apple
+    };
 }
 -(STKAudioPlayerOptions) options
 {
@@ -516,6 +532,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         options = optionsIn;
 		
 		self->volume = 1.0;
+        self->playbackRate = 1.0;
         self->equalizerEnabled = optionsIn.equalizerBandFrequencies[0] != 0;
 
         PopulateOptionsWithDefault(&options);
@@ -1034,8 +1051,72 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     OSSpinLockLock(&entry->spinLock);
     double retval = entry->seekTime + (entry->framesPlayed / canonicalAudioStreamBasicDescription.mSampleRate);
     OSSpinLockUnlock(&entry->spinLock);
-	
+
     return retval;
+}
+
+-(double) bufferedSecondsAhead
+{
+    OSSpinLockLock(&pcmBufferSpinLock);
+    UInt32 used = pcmBufferUsedFrameCount;
+    OSSpinLockUnlock(&pcmBufferSpinLock);
+
+    return used / canonicalAudioStreamBasicDescription.mSampleRate;
+}
+
+-(double) discardBufferedSeconds:(double)seconds
+{
+    if (seconds <= 0)
+    {
+        return 0;
+    }
+
+    OSSpinLockLock(&currentEntryReferencesLock);
+    STKQueueEntry* entry = currentlyPlayingEntry;
+    OSSpinLockUnlock(&currentEntryReferencesLock);
+
+    if (entry == nil || seekToTimeWasRequested)
+    {
+        return 0;
+    }
+
+    const Float64 sampleRate = canonicalAudioStreamBasicDescription.mSampleRate;
+    // The guard must exceed one render slice so a render pass that snapshotted
+    // the counters before this discard cannot underflow pcmBufferUsedFrameCount.
+    const UInt32 guardFrames = (UInt32)sampleRate;
+
+    OSSpinLockLock(&pcmBufferSpinLock);
+    UInt32 used = pcmBufferUsedFrameCount;
+    UInt32 discardable = used > guardFrames ? used - guardFrames : 0;
+    UInt32 framesToDiscard = MIN((UInt32)(seconds * sampleRate), discardable);
+    if (framesToDiscard > 0)
+    {
+        pcmBufferFrameStartIndex = (pcmBufferFrameStartIndex + framesToDiscard) % pcmBufferTotalFrameCount;
+        pcmBufferUsedFrameCount -= framesToDiscard;
+    }
+    OSSpinLockUnlock(&pcmBufferSpinLock);
+
+    if (framesToDiscard == 0)
+    {
+        return 0;
+    }
+
+    // Discarded frames count as played so progress jumps past them. Clamped to
+    // lastFrameQueued so completion detection on the next render pass stays
+    // consistent for finite streams (live streams have lastFrameQueued == -1).
+    OSSpinLockLock(&entry->spinLock);
+    SInt64 framesToAssign = framesToDiscard;
+    if (entry->lastFrameQueued >= 0)
+    {
+        framesToAssign = MIN(entry->lastFrameQueued - entry->framesPlayed, framesToAssign);
+    }
+    entry->framesPlayed += framesToAssign;
+    OSSpinLockUnlock(&entry->spinLock);
+
+    // Freeing ring space may unblock a decoder waiting on a full buffer.
+    [self wakeupPlaybackThread];
+
+    return framesToDiscard / sampleRate;
 }
 
 -(BOOL) invokeOnPlaybackThread:(void(^)())block
@@ -2242,6 +2323,38 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
 #endif
 }
 
+-(void) createTimePitchUnit
+{
+	OSStatus status;
+
+	if (!self->options.enableTimePitch)
+	{
+		return;
+	}
+
+	CHECK_STATUS_AND_RETURN(AUGraphAddNode(audioGraph, &timePitchDescription, &timePitchNode));
+	CHECK_STATUS_AND_RETURN(AUGraphNodeInfo(audioGraph, timePitchNode, NULL, &timePitchUnit));
+	CHECK_STATUS_AND_RETURN(AudioUnitSetProperty(timePitchUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFramesPerSlice, sizeof(maxFramesPerSlice)));
+
+	AudioUnitSetParameter(timePitchUnit, kNewTimePitchParam_Rate, kAudioUnitScope_Global, 0, playbackRate, 0);
+}
+
+-(void) setPlaybackRate:(float)value
+{
+	value = MAX(0.5f, MIN(2.0f, value));
+	playbackRate = value;
+
+	if (timePitchUnit)
+	{
+		AudioUnitSetParameter(timePitchUnit, kNewTimePitchParam_Rate, kAudioUnitScope_Global, 0, value, 0);
+	}
+}
+
+-(float) playbackRate
+{
+	return playbackRate;
+}
+
 -(void) setGain:(float)gain forEqualizerBand:(int)bandIndex
 {
 	if (!eqUnit)
@@ -2354,6 +2467,7 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
 	CHECK_STATUS_AND_RETURN(NewAUGraph(&audioGraph));
 	CHECK_STATUS_AND_RETURN(AUGraphOpen(audioGraph));
 	
+	[self createTimePitchUnit];
 	[self createEqUnit];
 	[self createMixerUnit];
 	[self createOutputUnit];
@@ -2379,6 +2493,15 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
     }
     
     [converterNodes removeAllObjects];
+
+    // The time-pitch node must be the pull head (the render callback attaches
+    // to nodes[0]): at rate r it pulls r× frames from the PCM ring per output
+    // frame, so ring drain and progress both scale with the rate.
+    if (timePitchNode)
+    {
+        [nodes addObject:@(timePitchNode)];
+        [units addObject:[NSValue valueWithPointer:timePitchUnit]];
+    }
 
     if (eqNode)
     {

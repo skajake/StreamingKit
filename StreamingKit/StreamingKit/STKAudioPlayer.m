@@ -197,11 +197,6 @@ STKAudioPlayerInternalState;
 
 #pragma mark STKAudioPlayer
 
-// 8192 (not 4096): with the screen off RemoteIO renders 4096-frame slices, and
-// at playbackRate > 1 the time-pitch node pulls more than one slice's worth of
-// frames from its upstream per render pass.
-static UInt32 maxFramesPerSlice = 8192;
-
 static AudioComponentDescription mixerDescription;
 static AudioComponentDescription nbandUnitDescription;
 static AudioComponentDescription outputUnitDescription;
@@ -245,6 +240,7 @@ static AudioStreamBasicDescription recordAudioStreamBasicDescription;
 	AudioComponentInstance outputUnit;
     AudioComponentInstance timePitchUnit;
     Float32 playbackRate;
+    UInt32 maxFramesPerSlice;
 		
     UInt32 eqBandCount;
     int32_t waitingForDataAfterSeekFrameCount;
@@ -533,6 +529,11 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 		
 		self->volume = 1.0;
         self->playbackRate = 1.0;
+        // With the screen off RemoteIO renders 4096-frame slices; at
+        // playbackRate > 1 the time-pitch node pulls more than one slice's
+        // worth from its upstream per render pass, so those graphs need the
+        // extra headroom (the larger per-unit buffers are wasted otherwise).
+        self->maxFramesPerSlice = optionsIn.enableTimePitch ? 8192 : 4096;
         self->equalizerEnabled = optionsIn.equalizerBandFrequencies[0] != 0;
 
         PopulateOptionsWithDefault(&options);
@@ -3031,11 +3032,7 @@ OSStatus AudioConverterCallback(AudioConverterRef inAudioConverter, UInt32* ioNu
         return;
     }
 
-    OSSpinLockLock(&pcmBufferSpinLock);
-    UInt32 framesAhead = pcmBufferUsedFrameCount;
-    OSSpinLockUnlock(&pcmBufferSpinLock);
-
-    double bufferedSecondsAhead = framesAhead / canonicalAudioStreamBasicDescription.mSampleRate;
+    double bufferedSecondsAhead = self.bufferedSecondsAhead;
 
     filter(canonicalAudioStreamBasicDescription.mChannelsPerFrame,
            canonicalAudioStreamBasicDescription.mBytesPerFrame,

@@ -626,8 +626,20 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 		AUGraphUninitialize(audioGraph);
 		AUGraphClose(audioGraph);
 		DisposeAUGraph(audioGraph);
-		
+
 		audioGraph = nil;
+
+		// DisposeAUGraph freed every unit; clear the cached pointers so a
+		// late property call (e.g. playbackRate after dispose) is a no-op
+		// instead of dereferencing freed memory.
+		timePitchUnit = nil;
+		timePitchNode = 0;
+		eqUnit = nil;
+		eqNode = 0;
+		mixerUnit = nil;
+		mixerNode = 0;
+		outputUnit = nil;
+		outputNode = 0;
     }
 }
 

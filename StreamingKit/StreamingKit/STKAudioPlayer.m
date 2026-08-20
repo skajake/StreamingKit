@@ -546,8 +546,18 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         pcmAudioBuffer = &pcmAudioBufferList.mBuffers[0];
         
         pcmAudioBufferList.mNumberBuffers = 1;
-        pcmAudioBufferList.mBuffers[0].mDataByteSize = (canonicalAudioStreamBasicDescription.mSampleRate * options.bufferSizeInSeconds) * canonicalAudioStreamBasicDescription.mBytesPerFrame;
-        pcmAudioBufferList.mBuffers[0].mData = (void*)calloc(pcmAudioBuffer->mDataByteSize, 1);
+        // Under memory pressure this calloc can fail; retry at smaller sizes
+        // (down to ~2s) so playback degrades instead of leaving mData NULL.
+        // A NULL mData after this loop marks the player unusable — playback
+        // entry points must check it before touching the buffer.
+        Float32 pcmBufferSizeInSeconds = options.bufferSizeInSeconds;
+        do
+        {
+            pcmAudioBufferList.mBuffers[0].mDataByteSize = (canonicalAudioStreamBasicDescription.mSampleRate * pcmBufferSizeInSeconds) * canonicalAudioStreamBasicDescription.mBytesPerFrame;
+            pcmAudioBufferList.mBuffers[0].mData = (void*)calloc(pcmAudioBuffer->mDataByteSize, 1);
+            pcmBufferSizeInSeconds /= 2;
+        }
+        while (pcmAudioBufferList.mBuffers[0].mData == NULL && pcmBufferSizeInSeconds >= 1);
         pcmAudioBufferList.mBuffers[0].mNumberChannels = 2;
 		
         pcmBufferFrameSizeInBytes = canonicalAudioStreamBasicDescription.mBytesPerFrame;
@@ -1223,7 +1233,17 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 {
     LOGINFO(([entry description]));
 
-    if (startPlaying)
+    if (entry != nil && (pcmAudioBuffer->mData == NULL || readBuffer == NULL))
+    {
+        // Buffer allocation failed at init (memory pressure); fail the play
+        // attempt instead of writing through NULL. nil entries still fall
+        // through so the clear/cleanup path below runs.
+        [self unexpectedError:STKAudioPlayerErrorAudioSystemError];
+
+        return;
+    }
+
+    if (startPlaying && pcmAudioBuffer->mData != NULL)
     {
         memset(&pcmAudioBuffer->mData[0], 0, pcmBufferTotalFrameCount * pcmBufferFrameSizeInBytes);
     }

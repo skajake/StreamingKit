@@ -562,7 +562,14 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 		
         pcmBufferFrameSizeInBytes = canonicalAudioStreamBasicDescription.mBytesPerFrame;
         pcmBufferTotalFrameCount = pcmAudioBuffer->mDataByteSize / pcmBufferFrameSizeInBytes;
-        
+
+        // A fallback ring can be smaller than the configured start/rebuffer
+        // thresholds; clamp them to the allocated capacity or the render path
+        // would wait forever for an occupancy the ring cannot hold (mirrors
+        // the MIN against bufferSizeInSeconds applied to the defaults).
+        framesRequiredToStartPlaying = MIN(framesRequiredToStartPlaying, pcmBufferTotalFrameCount);
+        framesRequiredToPlayAfterRebuffering = MIN(framesRequiredToPlayAfterRebuffering, pcmBufferTotalFrameCount);
+
         readBufferSize = options.readBufferSize;
         readBuffer = calloc(sizeof(UInt8), readBufferSize);
         

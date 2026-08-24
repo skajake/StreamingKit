@@ -41,6 +41,7 @@
 #import "NSMutableArray+STKAudioPlayer.h"
 #import "libkern/OSAtomic.h"
 #import <float.h>
+#import <stdatomic.h>
 
 #ifndef DBL_MAX
 #define DBL_MAX 1.7976931348623157e+308
@@ -240,7 +241,7 @@ static AudioStreamBasicDescription recordAudioStreamBasicDescription;
 	AudioComponentInstance outputUnit;
     AudioComponentInstance timePitchUnit;
     Float32 playbackRate;
-    volatile float pan;
+    _Atomic float pan;
     UInt32 maxFramesPerSlice;
 		
     UInt32 eqBandCount;
@@ -2431,11 +2432,13 @@ void STKApplyPanToInt16StereoInterleaved(SInt16* samples, UInt32 frameCount, flo
     // Stored and applied per-sample in OutputRenderCallback rather than via
     // kMultiChannelMixerParam_Pan: the mixer silently ignores Pan once
     // AUNewTimePitch's deinterleaved float output lands on its input bus.
-    pan = MAX(-1.0f, MIN(1.0f, panValue));
+    // Relaxed ordering suffices: the render thread only needs some recent
+    // value, and no other state is published alongside it.
+    atomic_store_explicit(&self->pan, MAX(-1.0f, MIN(1.0f, panValue)), memory_order_relaxed);
 }
 
 -(float)pan {
-    return pan;
+    return atomic_load_explicit(&self->pan, memory_order_relaxed);
 }
 
 -(void)setGain:(float)gainValue {
@@ -3300,7 +3303,7 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
 
 	// Balance must stay after the frame filters so clip capture and metering
 	// see the un-balanced audio; any zero-padded tail just scales to zero.
-	float panValue = audioPlayer->pan;
+	float panValue = atomic_load_explicit(&audioPlayer->pan, memory_order_relaxed);
 
 	if (panValue != 0 && canonicalAudioStreamBasicDescription.mChannelsPerFrame == 2)
 	{

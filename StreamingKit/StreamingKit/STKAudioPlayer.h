@@ -317,10 +317,21 @@ typedef void(^STKRawBytesFilter)(const UInt8* bytes, int length);
 /// Sets the gain value (from -96 low to +24 high) for an equalizer band (0 based index)
 -(void) setGain:(float)gain forEqualizerBand:(int)bandIndex;
 
+/// Sets the stereo balance, clamped to -1 (left channel only) through
+/// 0 (both channels) to +1 (right channel only). Applied per-sample at
+/// render time, after the frame filters — so clip capture and metering
+/// always see the un-balanced audio.
 -(void) setPan:(float)panValue;
+-(float) pan;
 -(void) setGain:(float)gainValue;
 -(double)bitRate;
 
 @end
+
+/// Scales a buffer of SInt16 interleaved stereo frames in place: a negative
+/// pan attenuates the right channel linearly, a positive pan the left, and
+/// values outside [-1, 1] are clamped. Exposed for unit testing; the player
+/// calls it from the render callback.
+void STKApplyPanToInt16StereoInterleaved(SInt16* samples, UInt32 frameCount, float pan);
 
 NS_ASSUME_NONNULL_END

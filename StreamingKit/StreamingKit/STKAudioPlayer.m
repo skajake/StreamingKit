@@ -240,6 +240,7 @@ static AudioStreamBasicDescription recordAudioStreamBasicDescription;
 	AudioComponentInstance outputUnit;
     AudioComponentInstance timePitchUnit;
     Float32 playbackRate;
+    volatile float pan;
     UInt32 maxFramesPerSlice;
 		
     UInt32 eqBandCount;
@@ -2407,11 +2408,34 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
 	CHECK_STATUS_AND_RETURN(AudioUnitSetParameter(eqUnit, kAUNBandEQParam_Gain + bandIndex, kAudioUnitScope_Global, 0, gain, 0));
 }
 
--(void)setPan:(float)panValue {
-    int result = AudioUnitSetParameter(mixerUnit, kMultiChannelMixerParam_Pan, kAudioUnitScope_Input, 0, panValue, 0);
-    if (result == 0) {
-       NSLog(@"success");
+void STKApplyPanToInt16StereoInterleaved(SInt16* samples, UInt32 frameCount, float pan)
+{
+    pan = MAX(-1.0f, MIN(1.0f, pan));
+
+    if (pan == 0)
+    {
+        return;
     }
+
+    float leftGain = pan > 0 ? 1.0f - pan : 1.0f;
+    float rightGain = pan < 0 ? 1.0f + pan : 1.0f;
+
+    for (UInt32 i = 0; i < frameCount; i++)
+    {
+        samples[i * 2] = (SInt16)(samples[i * 2] * leftGain);
+        samples[i * 2 + 1] = (SInt16)(samples[i * 2 + 1] * rightGain);
+    }
+}
+
+-(void)setPan:(float)panValue {
+    // Stored and applied per-sample in OutputRenderCallback rather than via
+    // kMultiChannelMixerParam_Pan: the mixer silently ignores Pan once
+    // AUNewTimePitch's deinterleaved float output lands on its input bus.
+    pan = MAX(-1.0f, MIN(1.0f, panValue));
+}
+
+-(float)pan {
+    return pan;
 }
 
 -(void)setGain:(float)gainValue {
@@ -3273,7 +3297,16 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
 			entry->filter(asbd.mChannelsPerFrame, asbd.mBytesPerFrame, inNumberFrames, ioData->mBuffers[0].mData);
 		}
 	}
-    
+
+	// Balance must stay after the frame filters so clip capture and metering
+	// see the un-balanced audio; any zero-padded tail just scales to zero.
+	float panValue = audioPlayer->pan;
+
+	if (panValue != 0 && canonicalAudioStreamBasicDescription.mChannelsPerFrame == 2)
+	{
+		STKApplyPanToInt16StereoInterleaved((SInt16*)ioData->mBuffers[0].mData, inNumberFrames, panValue);
+	}
+
     if (audioPlayer->equalizerEnabled != audioPlayer->equalizerOn)
     {
         Boolean isUpdated;

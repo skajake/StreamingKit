@@ -2455,7 +2455,14 @@ void STKApplyPanToInt16StereoInterleaved(SInt16* samples, UInt32 frameCount, flo
 	AudioComponentInstance convertUnit;
 	
 	CHECK_STATUS_AND_RETURN_VALUE(AUGraphAddNode(audioGraph, &convertUnitDescription, &convertNode), 0);
-	CHECK_STATUS_AND_RETURN_VALUE(AUGraphNodeInfo(audioGraph, convertNode, &mixerDescription, &convertUnit), 0);
+	// NULL, not &mixerDescription: AUGraphNodeInfo writes the node's own
+	// description to that argument, and mixerDescription is a static shared
+	// by every player. Passing it turned the description into the converter's
+	// the first time any player inserted a converter (e.g. behind the
+	// time-pitch unit), so every player created afterwards got an AUConverter
+	// in place of its mixer and setGain: (the app's Amplifier) failed with
+	// kAudioUnitErr_InvalidParameter.
+	CHECK_STATUS_AND_RETURN_VALUE(AUGraphNodeInfo(audioGraph, convertNode, NULL, &convertUnit), 0);
 	CHECK_STATUS_AND_RETURN_VALUE(AudioUnitSetProperty(convertUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &srcFormat, sizeof(srcFormat)), 0);
   	CHECK_STATUS_AND_RETURN_VALUE(AudioUnitSetProperty(convertUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &desFormat, sizeof(desFormat)), 0);
 	CHECK_STATUS_AND_RETURN_VALUE(AudioUnitSetProperty(convertUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFramesPerSlice, sizeof(maxFramesPerSlice)), 0);
